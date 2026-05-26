@@ -14,7 +14,7 @@ from constants import (
     METADATA_FILE_NAME,
     PARTNER_EVENTS_FILE_NAME
 )
-from push_file_to_lz import push_file_to_lz
+from push_file_to_lz import push_table_metadata_files
 from file_utils import FileType, read_from_file
 
 def mirror():
@@ -82,37 +82,14 @@ def mirror():
         logger.warning(f"removed non-exists collection {non_exists_collection}")
 
     for collection_name in collection_list:
-    #>>># changes to write metadata.json a the first file - 6Mar2025
         metadata_file_exists = read_from_file(
             collection_name, METADATA_FILE_NAME, FileType.TEXT
         )
-        if not metadata_file_exists: 
-            metadata_json_path = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)), METADATA_FILE_NAME
-                )
-            logger.info("writing metadata file to LZ")
-            push_file_to_lz(metadata_json_path, collection_name)
-
         partner_events_file_exists = read_from_file(
             collection_name, PARTNER_EVENTS_FILE_NAME, FileType.TEXT
         )
-        if not partner_events_file_exists:
-            partner_events_template_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "_partnerEvents_template.json"
-            )
-            partner_events_output_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), PARTNER_EVENTS_FILE_NAME
-            )
-            logger.info("writing _partnerEvents.json file to LZ")
-            with open(partner_events_template_path, 'r') as f:
-                partner_events_content = f.read()
-            partner_events_content = partner_events_content \
-                .replace('${MONGO_DB_NAME}', os.getenv('MONGO_DB_NAME', '')) \
-                .replace('${MONGO_COLLECTION}', collection_name) \
-                .replace('${LZ_URL}', os.getenv('LZ_URL', ''))
-            with open(partner_events_output_path, 'w') as output_file:
-                output_file.write(partner_events_content)
-            push_file_to_lz(partner_events_output_path, collection_name)
+        if not metadata_file_exists or not partner_events_file_exists:
+            push_table_metadata_files(collection_name)
 
         init_table_schema(collection_name)
 

@@ -11,6 +11,8 @@ TYPES_TO_CONVERT_TO_STR = [
 
 DATA_FILES_PATH = "data_files"
 
+SCHEMA_VERSION_DIR_NAME = ".versions"
+
 FILE_NAME_LENGTH = 20
 
 MONGODB_READING_BATCH_SIZE = 100000
@@ -25,12 +27,14 @@ ROW_MARKER_COLUMN_NAME = "__rowMarker__"
 CHANGE_STREAM_OPERATION_MAP = {
     "insert": 0,
     "update": 1,
+    "replace": 1,
     "delete": 2,
 }
 
 CHANGE_STREAM_OPERATION_MAP_WHEN_INIT = {
     "insert": 4,
     "update": 1,
+    "replace": 1,
     "delete": 2,
 }
 

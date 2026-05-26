@@ -84,3 +84,12 @@ def find_column_renaming(table_name: str, column_name: str) -> str:
 
 def get_table_column_renaming(table_name: str) -> dict:
     return __column_renamings.get(table_name, None)
+
+
+def reset_table_schema(table_name: str):
+    # Clear in-memory schema + renaming for this table. Used when bumping schema
+    # version: the next process_dataframe call will re-seed the schema in the new
+    # versioned directory as if every column were brand-new.
+    __schemas.pop(table_name, None)
+    __column_renamings.pop(table_name, None)
+    __locks.pop(table_name, None)

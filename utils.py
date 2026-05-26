@@ -1,13 +1,52 @@
 import os
-from constants import DATA_FILES_PATH, FILE_NAME_LENGTH
+import pickle
+from constants import DATA_FILES_PATH, FILE_NAME_LENGTH, SCHEMA_VERSION_DIR_NAME
 
 
 def to_string(obj) -> str:
     return str(obj)
 
+
+def sanitize_table_name(name: str) -> str:
+    # Fabric's landing zone silently skips folders containing '.', so map dotted
+    # MongoDB collection names to a Fabric-safe form. MongoDB queries continue to
+    # use the original (un-sanitized) name.
+    return name.replace(".", "_")
+
+
+def _schema_version_file_path(collection_name: str) -> str:
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    versions_dir = os.path.join(current_dir, DATA_FILES_PATH, SCHEMA_VERSION_DIR_NAME)
+    os.makedirs(versions_dir, exist_ok=True)
+    return os.path.join(versions_dir, sanitize_table_name(collection_name) + ".pkl")
+
+
+def get_schema_version(collection_name: str) -> int:
+    path = _schema_version_file_path(collection_name)
+    if not os.path.exists(path):
+        return 1
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def set_schema_version(collection_name: str, version: int) -> None:
+    path = _schema_version_file_path(collection_name)
+    with open(path, "wb") as f:
+        pickle.dump(version, f)
+
+
+def get_effective_table_name(collection_name: str) -> str:
+    sanitized = sanitize_table_name(collection_name)
+    version = get_schema_version(collection_name)
+    if version <= 1:
+        return sanitized
+    return f"{sanitized}_v{version}"
+
+
 def get_table_dir(table_name: str) -> str:
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    table_dir = os.path.join(current_dir, DATA_FILES_PATH, table_name + os.sep)
+    effective_name = get_effective_table_name(table_name)
+    table_dir = os.path.join(current_dir, DATA_FILES_PATH, effective_name + os.sep)
     os.makedirs(table_dir, exist_ok=True)
     return table_dir
 #changes to get next parquet file num based on the last parquet from LZ, it will pass 0 if first file

@@ -24,8 +24,15 @@ from constants import (
     DTYPE_KEY,
     TYPE_KEY,
 )
-from utils import to_string, get_parquet_full_path_filename, get_temp_parquet_full_path_filename, get_table_dir
-from push_file_to_lz import push_file_to_lz
+from utils import (
+    to_string,
+    get_parquet_full_path_filename,
+    get_temp_parquet_full_path_filename,
+    get_table_dir,
+    get_schema_version,
+    set_schema_version,
+)
+from push_file_to_lz import push_file_to_lz, push_table_metadata_files
 #from flags import get_init_flag
 from init_sync import init_sync
 import schemas
@@ -150,7 +157,28 @@ def listening(collection_name: str):
                     resume_token = change["_id"]
                     logger.debug("resume_token: %s", resume_token)
 
-                    schema_utils.process_dataframe(collection_name, df)
+                    schema_change_signal = schema_utils.process_dataframe(collection_name, df)
+
+                    if schema_change_signal is not None and init_sync_stat_flag == "Y":
+                        logger.warning(
+                            "schema-change signal received for collection %s on column %s "
+                            "(expected=%s, actual=%s); bumping schema version",
+                            collection_name,
+                            schema_change_signal.column_name,
+                            schema_change_signal.expected_type,
+                            schema_change_signal.actual_type,
+                        )
+                        accumulative_df, last_sync_time = __bump_schema_version(
+                            collection_name,
+                            accumulative_df,
+                            resume_token,
+                            init_sync_stat_flag,
+                            last_sync_time,
+                            time_threshold_in_sec,
+                            doc,
+                            logger,
+                        )
+                        continue
 
                     if init_sync_stat_flag != "Y":
                         logger.debug(
@@ -258,11 +286,12 @@ def listening(collection_name: str):
             continue
 
 ##>> enhancement to check time elapsed even if no event comes - no waiting indefinitely for a change
-def process_accumulative_df(accumulative_df, collection_name, init_sync_stat_flag, last_sync_time, time_threshold_in_sec, resume_token, logger):
+def process_accumulative_df(accumulative_df, collection_name, init_sync_stat_flag, last_sync_time, time_threshold_in_sec, resume_token, logger, force_flush=False):
     if not init_sync_stat_flag == "Y":
         if (accumulative_df is not None
             and (
-                (accumulative_df.shape[0] >= int(os.getenv("DELTA_SYNC_BATCH_SIZE")))
+                force_flush
+                or (accumulative_df.shape[0] >= int(os.getenv("DELTA_SYNC_BATCH_SIZE")))
             )
         ):
             prefix = TEMP_PREFIX_DURING_INIT
@@ -272,11 +301,12 @@ def process_accumulative_df(accumulative_df, collection_name, init_sync_stat_fla
             logger.info(f"writing TEMP parquet file: {parquet_full_path_filename}")
             accumulative_df.to_parquet(parquet_full_path_filename)
             accumulative_df = None
-    else:        
+    else:
         if (accumulative_df is not None
         ):
             if(
-                (accumulative_df.shape[0] >= int(os.getenv("DELTA_SYNC_BATCH_SIZE")))
+                force_flush
+                or (accumulative_df.shape[0] >= int(os.getenv("DELTA_SYNC_BATCH_SIZE")))
                 or ((time.time() - last_sync_time) >= time_threshold_in_sec)
             ):
                 prefix = ""
@@ -318,6 +348,80 @@ def process_accumulative_df(accumulative_df, collection_name, init_sync_stat_fla
                     FileType.PICKLE,
             )
     return accumulative_df, last_sync_time
+
+def __bump_schema_version(
+    collection_name,
+    accumulative_df,
+    resume_token,
+    init_sync_stat_flag,
+    last_sync_time,
+    time_threshold_in_sec,
+    offending_doc,
+    logger,
+):
+    # 1. Flush whatever is currently accumulated into the OLD versioned folder so
+    # no buffered rows are lost across the boundary. The offending doc isn't in
+    # accumulative_df yet (the signal returned before the concat step), so the
+    # flush cleanly contains only docs that match the old schema.
+    if accumulative_df is not None:
+        accumulative_df, last_sync_time = process_accumulative_df(
+            accumulative_df,
+            collection_name,
+            init_sync_stat_flag,
+            last_sync_time,
+            time_threshold_in_sec,
+            resume_token,
+            logger,
+            force_flush=True,
+        )
+
+    # 2. Bump the schema version. From this point, get_table_dir/get_effective_table_name
+    # return the new versioned directory and LZ folder.
+    old_version = get_schema_version(collection_name)
+    new_version = old_version + 1
+    set_schema_version(collection_name, new_version)
+    logger.info(
+        "schema version for collection %s bumped from %d to %d",
+        collection_name,
+        old_version,
+        new_version,
+    )
+
+    # 3. Reset in-memory schema state so process_dataframe re-seeds from scratch.
+    schemas.reset_table_schema(collection_name)
+
+    # 4. Carry forward state that must persist across versions. write_to_file
+    # writes locally to the new versioned dir AND pushes to the new LZ folder.
+    write_to_file(
+        resume_token,
+        collection_name,
+        DELTA_SYNC_RESUME_TOKEN_FILE_NAME,
+        FileType.PICKLE,
+    )
+    write_to_file(
+        init_sync_stat_flag,
+        collection_name,
+        INIT_SYNC_STATUS_FILE_NAME,
+        FileType.PICKLE,
+    )
+
+    # 5. Push fresh metadata files to the new LZ folder so Fabric can ingest
+    # the new versioned table.
+    push_table_metadata_files(collection_name)
+
+    # 6. Re-seed schema by processing the offending doc as the first row of the
+    # new version. With in-memory schema cleared, every column hits the
+    # "new column" branch in process_dataframe and gets a fresh entry.
+    new_df = pd.DataFrame([offending_doc])
+    schema_utils.process_dataframe(collection_name, new_df)
+
+    # 7. The first row in the new versioned table is, by definition, an insert
+    # (the prior table is closed). Use the insert row marker regardless of the
+    # underlying Mongo operationType.
+    new_df.insert(0, ROW_MARKER_COLUMN_NAME, [CHANGE_STREAM_OPERATION_MAP["insert"]])
+
+    return new_df, time.time()
+
 
 def __post_init_flush(table_name: str, logger):
     if not logger:

@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import date, datetime
 import os
 import json
@@ -145,6 +146,35 @@ TYPE_TO_CONVERT_FUNCTION_MAP = {
     pd.Timestamp: to_pandas_timestamp,
     bson.binary.Binary: do_nothing
 }
+
+@dataclass
+class SchemaChangeSignal:
+    column_name: str
+    expected_type: type
+    actual_type: type
+
+
+_NUMERIC_TYPES = {int, float, np.int32, np.int64, np.float64, bson.int64.Int64, bson.Decimal128}
+_BOOL_TYPES = {bool, np.bool_}
+_DATETIME_TYPES = {date, datetime, pd.Timestamp}
+_TO_STRING_TYPES = {list, dict, bson.ObjectId, bson.binary.Binary}
+
+
+def _types_compatible(expected_type, actual_type) -> bool:
+    if expected_type == actual_type:
+        return True
+    if actual_type is NoneType:
+        return True
+    if expected_type in _NUMERIC_TYPES and actual_type in _NUMERIC_TYPES:
+        return True
+    if expected_type in _BOOL_TYPES and actual_type in _BOOL_TYPES:
+        return True
+    if expected_type in _DATETIME_TYPES and actual_type in _DATETIME_TYPES:
+        return True
+    if expected_type == str and actual_type in _TO_STRING_TYPES:
+        return True
+    return False
+
 
 COLUMN_DTYPE_CONVERSION_MAP = {
     # date type fix
@@ -306,7 +336,7 @@ def process_dataframe(table_name_param: str, df: pd.DataFrame):
         current_dtype = df[col_name].dtype
         current_first_item = _get_first_item(df, col_name)
         #current_item_type = type(current_first_item)
-        
+
 
         processed_col_name = schemas.find_column_renaming(table_name, col_name)
         logger.debug(
@@ -316,7 +346,8 @@ def process_dataframe(table_name_param: str, df: pd.DataFrame):
         logger.debug(
                     f"%%%% In process_df: schema_of_this_column is {schema_of_this_column} %%%%%"
                 )
-        if not processed_col_name and not schema_of_this_column:
+        is_new_column = not processed_col_name and not schema_of_this_column
+        if is_new_column:
             logger.debug(
                     f"%%%% In process_df, schema of col doesnt exist: schema_of_this_column is {schema_of_this_column} and processed_col_name is {processed_col_name} %%%%%"
                 )
@@ -348,6 +379,24 @@ def process_dataframe(table_name_param: str, df: pd.DataFrame):
         # existing column or new column with schema appended, process according to schema_of_this_column
         #if current_item_type != schema_of_this_column[TYPE_KEY]:
         expected_type = schema_of_this_column[TYPE_KEY]
+
+        # Detect breaking type change on an existing column. Caller decides whether
+        # to act on it (e.g. listening.py bumps the schema version; init_sync.py ignores).
+        if not is_new_column and current_first_item is not None:
+            actual_type = type(current_first_item)
+            is_nan_scalar = (
+                actual_type in (float, np.float64) and pd.isna(current_first_item)
+            )
+            if not is_nan_scalar and not _types_compatible(expected_type, actual_type):
+                logger.warning(
+                    f"schema change detected on column {col_name}: "
+                    f"expected {expected_type}, got {actual_type}"
+                )
+                return SchemaChangeSignal(
+                    column_name=col_name,
+                    expected_type=expected_type,
+                    actual_type=actual_type,
+                )
         for item in df[col_name]:
             current_column_name = col_name
             if not isinstance(item, expected_type):
@@ -429,3 +478,4 @@ def process_dataframe(table_name_param: str, df: pd.DataFrame):
     conversion_log_path = os.path.join(get_table_dir(table_name), CONVERSION_LOG_FILE_NAME)
     if os.path.exists(conversion_log_path) and conversion_flag:
         push_file_to_lz(conversion_log_path, table_name)
+    return None

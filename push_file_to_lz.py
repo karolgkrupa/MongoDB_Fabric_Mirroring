@@ -6,6 +6,7 @@ import logging
 from datetime import datetime
 import utils
 import constants
+from constants import METADATA_FILE_NAME, PARTNER_EVENTS_FILE_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ def __patch_file(access_token, file_path, lz_url, table_name):
     try:
         file_name = os.path.basename(file_path)
         file_name_temp = file_name
-        base_url = lz_url + table_name + "/"
+        base_url = lz_url + utils.get_effective_table_name(table_name) + "/"
         if not file_name.startswith('_'):
             file_name_temp = '_' + file_name
         else:
@@ -141,7 +142,7 @@ def get_file_from_lz(table_name, file_name):
         os.getenv("APP_ID"), os.getenv("SECRET"), os.getenv("TENANT_ID")
     )
     token_headers = {"Authorization": "Bearer " + access_token, "content-length": "0"}
-    url = os.getenv("LZ_URL") + table_name + "/" + file_name
+    url = os.getenv("LZ_URL") + utils.get_effective_table_name(table_name) + "/" + file_name
     response = requests.get(url, headers=token_headers)
     response_status_code = response.status_code
     if response_status_code != 200:
@@ -157,6 +158,27 @@ def get_file_from_lz(table_name, file_name):
     return (response_status_code, response)
 
 
+def push_table_metadata_files(collection_name):
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    metadata_path = os.path.join(current_dir, METADATA_FILE_NAME)
+    logger.info("writing metadata file to LZ")
+    push_file_to_lz(metadata_path, collection_name)
+
+    partner_events_template_path = os.path.join(current_dir, "_partnerEvents_template.json")
+    partner_events_output_path = os.path.join(current_dir, PARTNER_EVENTS_FILE_NAME)
+    logger.info("writing _partnerEvents.json file to LZ")
+    with open(partner_events_template_path, 'r') as f:
+        partner_events_content = f.read()
+    partner_events_content = partner_events_content \
+        .replace('${MONGO_DB_NAME}', os.getenv('MONGO_DB_NAME', '')) \
+        .replace('${MONGO_COLLECTION}', utils.get_effective_table_name(collection_name)) \
+        .replace('${LZ_URL}', os.getenv('LZ_URL', ''))
+    with open(partner_events_output_path, 'w') as output_file:
+        output_file.write(partner_events_content)
+    push_file_to_lz(partner_events_output_path, collection_name)
+
+
 def delete_file_from_lz(table_name, file_name):
     logger.info(
         f"trying to delete file from lz. table_name={table_name}, file_name={file_name}"
@@ -165,7 +187,7 @@ def delete_file_from_lz(table_name, file_name):
         os.getenv("APP_ID"), os.getenv("SECRET"), os.getenv("TENANT_ID")
     )
     token_headers = {"Authorization": "Bearer " + access_token, "content-length": "0"}
-    url = os.getenv("LZ_URL") + table_name + "/" + file_name
+    url = os.getenv("LZ_URL") + utils.get_effective_table_name(table_name) + "/" + file_name
     response = requests.delete(url, headers=token_headers)
     logger.debug(f"delete response: {response}")
     return response.status_code if response.status_code == 200 else None
