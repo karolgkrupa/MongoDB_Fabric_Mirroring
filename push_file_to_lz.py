@@ -136,7 +136,7 @@ def __patch_file(access_token, file_path, lz_url, table_name):
 
 def get_file_from_lz(table_name, file_name):
     logger.info(
-        f"trying to get file from lz. table_name={table_name}, file_name={file_name}"
+        f"trying to get file from lz. table_name={utils.get_effective_table_name(table_name)}, file_name={file_name}"
     )
     access_token = __get_access_token(
         os.getenv("APP_ID"), os.getenv("SECRET"), os.getenv("TENANT_ID")

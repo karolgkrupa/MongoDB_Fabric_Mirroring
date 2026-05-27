@@ -89,7 +89,9 @@ def get_table_column_renaming(table_name: str) -> dict:
 def reset_table_schema(table_name: str):
     # Clear in-memory schema + renaming for this table. Used when bumping schema
     # version: the next process_dataframe call will re-seed the schema in the new
-    # versioned directory as if every column were brand-new.
+    # versioned directory as if every column were brand-new. The lock is a sync
+    # primitive (not schema state) and must stay in place so append_schema_column
+    # / add_column_renaming can acquire it during re-seeding.
     __schemas.pop(table_name, None)
     __column_renamings.pop(table_name, None)
-    __locks.pop(table_name, None)
+    __locks.setdefault(table_name, threading.Lock())
