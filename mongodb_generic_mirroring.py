@@ -106,10 +106,12 @@ def mirror():
 
     # for thread in threads:
     #     thread.join()
-    while True:
-        cmd = input()
-        if cmd.lower() == "quit":
-            os._exit(0)
+
+    # mirror() returns after starting the (non-daemon) listener threads, which keep
+    # the process alive on their own. This lets mirror() be used both from the Flask
+    # entry point (app.py) and from a headless context such as a Windows service
+    # (service_runner.py), where there is no console stdin to read a "quit" command.
+    logger.info("Mirroring started for collections: %s", collection_list)
 
 
 def __get_all_collections() -> list[str]:
@@ -128,4 +130,20 @@ def __get_all_collections() -> list[str]:
 
 
 if __name__ == "__main__":
+    import sys
+
     mirror()
+    # When run interactively, keep supporting the manual "quit" command. In a
+    # non-interactive context (e.g. a service) there is no stdin, so just block
+    # on the listener threads instead of crashing on EOF.
+    if sys.stdin and sys.stdin.isatty():
+        while True:
+            cmd = input()
+            if cmd.lower() == "quit":
+                os._exit(0)
+    else:
+        import threading
+
+        for thread in threading.enumerate():
+            if thread is not threading.current_thread():
+                thread.join()

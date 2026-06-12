@@ -1,0 +1,38 @@
+<service>
+  <!--
+    WinSW service definition for the MongoDB -> Microsoft Fabric mirroring app.
+
+    The WinSW executable must sit next to this file and share its base name,
+    i.e. windows-service\mongodb-fabric-mirroring.exe. install.ps1 downloads it
+    for you. %BASE% resolves to the directory containing the .exe/.xml, so the
+    repo root is %BASE%\.. and the uv-managed virtual environment is
+    %BASE%\..\.venv.
+  -->
+  <id>mongodb-fabric-mirroring</id>
+  <name>MongoDB to Fabric Mirroring</name>
+  <description>Replicates MongoDB Atlas data into Microsoft Fabric OneLake in near real time.</description>
+
+  <executable>%BASE%\..\.venv\Scripts\python.exe</executable>
+  <arguments>service_runner.py</arguments>
+  <workingdirectory>%BASE%\..</workingdirectory>
+
+  <!-- Start automatically on boot. delayedAutoStart waits until other services
+       and networking are ready, which is safer for an app that needs outbound
+       connectivity to MongoDB Atlas and Fabric. -->
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+
+  <!-- Restart the service if the process exits unexpectedly. -->
+  <onfailure action="restart" delay="15 sec" />
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- Unbuffered output so stdout/stderr show up promptly in the log files. -->
+  <env name="PYTHONUNBUFFERED" value="1" />
+
+  <!-- Rolling stdout/stderr/wrapper logs under windows-service\logs. -->
+  <logpath>%BASE%\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+</service>
