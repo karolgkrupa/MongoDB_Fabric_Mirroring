@@ -50,11 +50,9 @@ def read_from_file(table_name: str, file_name: str, file_type: FileType):
     if response_status_code == 200: 
         if file_type == FileType.PICKLE:
             obj = pickle.loads(file_content.content)
-            print("Type of object: ", isinstance(obj, bytes))
             # Check if the result is itself a pickled object (nested)
             if isinstance(obj, bytes):
                 obj = pickle.loads(obj)
-            print("Unpickled object: ", obj)
             return obj
 
         elif file_type == FileType.TEXT:

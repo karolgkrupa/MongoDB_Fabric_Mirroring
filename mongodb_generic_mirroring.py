@@ -1,4 +1,3 @@
-import logging.handlers
 import os
 import logging
 from threading import Thread
@@ -16,28 +15,13 @@ from constants import (
 )
 from push_file_to_lz import push_table_metadata_files
 from file_utils import FileType, read_from_file
+from logging_config import setup_logging
+
+logger = logging.getLogger(__name__)
 
 def mirror():
     load_dotenv()
-    log_format_os = os.getenv("APP_LOG_LEVEL")
-    print(f"log_level before getlevels =={log_format_os}")
-    # changed to _nameToLevel as getLevelNamesMapping is available from python 3.11
-    #log_level = logging.getLevelNamesMapping().get(log_format_os, logging.INFO)
-    log_level = logging._nameToLevel.get(log_format_os, logging.INFO)
-    #Display Log level set
-    print(f"log_level set ={log_level}")
-    log_format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    logging.basicConfig(level=log_level, format=log_format_str)
-    root_logger = logging.getLogger()
-    logging_formatter = logging.Formatter(log_format_str)
-    #Changed to rotate logs
-    #file_handler = logging.FileHandler("mirroring.log")
-    file_handler = logging.handlers.RotatingFileHandler('mirroring.log', maxBytes=50*1024*1024, backupCount=5)
-
-    file_handler.setFormatter(logging_formatter)
-    root_logger.addHandler(file_handler)
-
-    logger = logging.getLogger(__name__)
+    setup_logging()
     if (
         not os.getenv("MONGO_CONN_STR")
         or not os.getenv("MONGO_DB_NAME")
@@ -118,7 +102,7 @@ def __get_all_collections() -> list[str]:
     client = pymongo.MongoClient(os.getenv("MONGO_CONN_STR"))
     # check database existence
     db_name = os.getenv("MONGO_DB_NAME")
-    print(f"db_name={db_name}")
+    logger.debug("db_name=%s", db_name)
     try:
         all_db_names = client.list_database_names()
         if db_name not in all_db_names:

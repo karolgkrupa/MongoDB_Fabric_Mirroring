@@ -18,7 +18,7 @@ aad_token = os.getenv('AAD_TOKEN')
 workspace_id = os.getenv('WORKSPACE_ID')
 mirror_db_name = os.getenv('MIRROR_DB_NAME')
 
-print("AAD Token:", aad_token)
+print("AAD Token:", "<set>" if aad_token else "<missing>")
 print("Workspace ID:", workspace_id)
 print("Mirror DB Name:", mirror_db_name)
 

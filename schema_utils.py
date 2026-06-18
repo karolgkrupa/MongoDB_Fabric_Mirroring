@@ -42,7 +42,12 @@ def _converter_template(obj, type_name, raw_convert_func, default_value=None):
     try:
         return raw_convert_func(obj)
     except (ValueError, TypeError):
-        logger.warning(f'Unsuccessful conversion from "{obj}" of type {original_type} to {type_name}.')
+        logger.warning(
+            'Unsuccessful conversion of column "%s" from type %s to %s; using default.',
+            current_column_name,
+            original_type,
+            type_name,
+        )
         global conversion_flag
         conversion_flag = True
 
@@ -104,8 +109,7 @@ def to_pandas_timestamp(obj) -> pd.Timestamp:
 
 
 def do_nothing(obj):
-    original_type = type(obj)
-    logger.info(f'Did not convert "{obj}" of type {original_type}.')
+    logger.debug("did not convert value of type %s", type(obj))
     return obj
 
 
@@ -409,7 +413,6 @@ def process_dataframe(table_name_param: str, df: pd.DataFrame):
                 
                 # Set the current column name for logging
                 df[col_name] = df[col_name].apply(conversion_fcn)
-                print(df[col_name])
                 break
         # for index, item in enumerate(df[col_name]):
             # print(f"Row {index}: Value={item}, Type={type(item)}")
@@ -474,7 +477,6 @@ def process_dataframe(table_name_param: str, df: pd.DataFrame):
                     + f"the dtype of the column {col_name} from {current_dtype} to {schema_of_this_column[DTYPE_KEY]}"
                 )  
     # Check if conversion log file exists before pushing
-    print("conversion_flag: ", conversion_flag)
     conversion_log_path = os.path.join(get_table_dir(table_name), CONVERSION_LOG_FILE_NAME)
     if os.path.exists(conversion_log_path) and conversion_flag:
         push_file_to_lz(conversion_log_path, table_name)

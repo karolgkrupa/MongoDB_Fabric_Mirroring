@@ -198,8 +198,10 @@ def listening(collection_name: str):
                         accumulative_df = pd.concat(
                             [accumulative_df, df], ignore_index=True
                         )
-                        logger.info("concat accumulative_df result:")
-                        logger.info(accumulative_df)
+                        logger.info(
+                            "added record to batch; accumulative rows=%d",
+                            accumulative_df.shape[0],
+                        )
                     else:
                         logger.info("df created")
                         accumulative_df = df
