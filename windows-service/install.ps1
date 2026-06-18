@@ -1,13 +1,18 @@
 <#
 .SYNOPSIS
-    Installs and starts the "MongoDB to Fabric Mirroring" Windows service.
+    Installs/updates and starts the "MongoDB to Fabric Mirroring" Windows service.
 
 .DESCRIPTION
-    Run from an elevated (Administrator) PowerShell prompt. The script:
+    Run from an elevated (Administrator) PowerShell prompt. The script is
+    idempotent: run it the first time to install, and re-run it any time to
+    update an existing install. It:
       1. Verifies uv is installed (and installs it if missing).
       2. Creates/updates the project's virtual environment with `uv sync`.
       3. Downloads the WinSW service wrapper next to the service config (if needed).
-      4. Installs and starts the Windows service so it auto-starts on every boot.
+      3b. Stamps the current git commit into the service description.
+      4. If the service does not exist, installs and starts it (auto-start on boot).
+         If it already exists, refreshes the config and restarts it so the latest
+         code and configuration take effect.
 
     Before running, make sure you have created and populated a .env file in the
     repo root (copy .env_example to .env and fill in the values).
@@ -86,17 +91,66 @@ if (-not (Test-Path $WinSwConfig)) {
     throw "Service configuration not found at $WinSwConfig."
 }
 
-# --- 4. Install and start the service ---------------------------------------
-Write-Host "Installing the Windows service '$ServiceId'..." -ForegroundColor Cyan
-& $WinSwExe install $WinSwConfig
-if ($LASTEXITCODE -ne 0) { throw "WinSW install failed with exit code $LASTEXITCODE." }
+# --- 3b. Stamp the current git commit into the service description ----------
+# This makes services.msc / Get-Service show exactly which build is deployed,
+# so it's easy to tell whether (and to what) the service has been updated. The
+# stamp is rewritten on every run; the regex strips any prior "(build ...)"
+# suffix so repeated installs/updates don't accumulate suffixes.
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    $commit = (& git -C $RepoRoot rev-parse --short HEAD 2>$null)
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($commit)) {
+        $commit = $commit.Trim()
+        # Flag a dirty working tree so an ad-hoc edited deployment is distinguishable.
+        & git -C $RepoRoot diff --quiet HEAD 2>$null
+        if ($LASTEXITCODE -eq 1) { $commit = "$commit-dirty" }
 
-Write-Host "Starting the service..." -ForegroundColor Cyan
-& $WinSwExe start $WinSwConfig
-if ($LASTEXITCODE -ne 0) { throw "WinSW start failed with exit code $LASTEXITCODE." }
+        $installedUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
 
-Write-Host ""
-Write-Host "Done. The '$ServiceId' service is installed and set to start automatically on boot." -ForegroundColor Green
+        [xml]$xml = Get-Content $WinSwConfig
+        $descNode = $xml.SelectSingleNode('/service/description')
+        $baseDesc = $descNode.InnerText -replace '\s*\(build [^)]*\)\s*$', ''
+        $descNode.InnerText = "$baseDesc (build $commit, installed $installedUtc)"
+        $xml.Save($WinSwConfig)
+        Write-Host "Service description stamped: build $commit (installed $installedUtc)." -ForegroundColor Cyan
+    } else {
+        Write-Warning "Could not read git commit hash; service description left unchanged."
+    }
+} else {
+    Write-Warning "git not found; service description left unchanged."
+}
+
+# --- 4. Install (first run) or update (re-run) the service ------------------
+# Re-running this script should update an existing install rather than fail, so
+# we branch on whether the service is already registered. `refresh` re-applies
+# the .xml (e.g. the new description above) to the registered service, and the
+# stop/start picks up the latest code from the working directory.
+$existing = Get-Service -Name $ServiceId -ErrorAction SilentlyContinue
+if ($existing) {
+    Write-Host "Service '$ServiceId' already exists; updating it..." -ForegroundColor Cyan
+    & $WinSwExe refresh $WinSwConfig
+    if ($LASTEXITCODE -ne 0) { throw "WinSW refresh failed with exit code $LASTEXITCODE." }
+
+    Write-Host "Restarting the service to pick up the latest code and config..." -ForegroundColor Cyan
+    # Stop first (ignore failure if it's already stopped), then start, so this
+    # works regardless of the service's current state.
+    & $WinSwExe stop $WinSwConfig
+    & $WinSwExe start $WinSwConfig
+    if ($LASTEXITCODE -ne 0) { throw "WinSW start failed with exit code $LASTEXITCODE." }
+
+    Write-Host ""
+    Write-Host "Done. The '$ServiceId' service has been updated and restarted." -ForegroundColor Green
+} else {
+    Write-Host "Installing the Windows service '$ServiceId'..." -ForegroundColor Cyan
+    & $WinSwExe install $WinSwConfig
+    if ($LASTEXITCODE -ne 0) { throw "WinSW install failed with exit code $LASTEXITCODE." }
+
+    Write-Host "Starting the service..." -ForegroundColor Cyan
+    & $WinSwExe start $WinSwConfig
+    if ($LASTEXITCODE -ne 0) { throw "WinSW start failed with exit code $LASTEXITCODE." }
+
+    Write-Host ""
+    Write-Host "Done. The '$ServiceId' service is installed and set to start automatically on boot." -ForegroundColor Green
+}
 Write-Host "Logs:        $LogsDir" -ForegroundColor Green
 Write-Host "App log:     $(Join-Path $RepoRoot 'mirroring.log')" -ForegroundColor Green
 Write-Host "Manage it:   services.msc  (or)  .\$ServiceId.exe status|stop|restart $ServiceId.xml" -ForegroundColor Green

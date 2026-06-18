@@ -90,9 +90,48 @@ Set-ExecutionPolicy -Scope Process Bypass
    - install uv if it is missing,
    - run `uv sync` to build the `.venv`,
    - download the WinSW wrapper (`mongodb-fabric-mirroring.exe`) next to the
-     service config, and
+     service config,
+   - stamp the current git commit into the service description (so you can tell
+     which build is deployed — see "Update" below), and
    - install and start the **MongoDB to Fabric Mirroring** service, set to start
      automatically on boot.
+
+### Update
+
+`install.ps1` is idempotent — to deploy a new version, pull the code and **re-run
+the same installer** from an elevated PowerShell prompt:
+
+```powershell
+git pull
+cd windows-service
+Set-ExecutionPolicy -Scope Process Bypass
+.\install.ps1
+```
+
+When the service already exists, the script runs `uv sync`, refreshes the service
+config, and restarts the service (instead of failing on a duplicate install). It
+also re-stamps the service **description** with the current commit, e.g.:
+
+```
+Replicates MongoDB Atlas data into Microsoft Fabric OneLake in near real time. (build a1b2c3d, installed 2026-06-18 09:30 UTC)
+```
+
+You can read that stamp at any time to confirm which build is running:
+
+```powershell
+(Get-Service mongodb-fabric-mirroring).DisplayName   # service name
+Get-CimInstance Win32_Service -Filter "Name='mongodb-fabric-mirroring'" | Select-Object Description
+```
+
+A `-dirty` suffix on the commit means the working tree had uncommitted changes
+when the service was installed.
+
+If you only changed Python code (no dependency or `.xml` change), a plain restart
+is enough and you don't have to re-run the installer:
+
+```powershell
+Restart-Service mongodb-fabric-mirroring
+```
 
 ### Where the logs are
 
