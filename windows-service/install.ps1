@@ -91,34 +91,6 @@ if (-not (Test-Path $WinSwConfig)) {
     throw "Service configuration not found at $WinSwConfig."
 }
 
-# --- 3b. Stamp the current git commit into the service description ----------
-# This makes services.msc / Get-Service show exactly which build is deployed,
-# so it's easy to tell whether (and to what) the service has been updated. The
-# stamp is rewritten on every run; the regex strips any prior "(build ...)"
-# suffix so repeated installs/updates don't accumulate suffixes.
-if (Get-Command git -ErrorAction SilentlyContinue) {
-    $commit = (& git -C $RepoRoot rev-parse --short HEAD 2>$null)
-    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($commit)) {
-        $commit = $commit.Trim()
-        # Flag a dirty working tree so an ad-hoc edited deployment is distinguishable.
-        & git -C $RepoRoot diff --quiet HEAD 2>$null
-        if ($LASTEXITCODE -eq 1) { $commit = "$commit-dirty" }
-
-        $installedUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
-
-        [xml]$xml = Get-Content $WinSwConfig
-        $descNode = $xml.SelectSingleNode('/service/description')
-        $baseDesc = $descNode.InnerText -replace '\s*\(build [^)]*\)\s*$', ''
-        $descNode.InnerText = "$baseDesc (build $commit, installed $installedUtc)"
-        $xml.Save($WinSwConfig)
-        Write-Host "Service description stamped: build $commit (installed $installedUtc)." -ForegroundColor Cyan
-    } else {
-        Write-Warning "Could not read git commit hash; service description left unchanged."
-    }
-} else {
-    Write-Warning "git not found; service description left unchanged."
-}
-
 # --- 4. (Re)install and start the service -----------------------------------
 # Re-running this script should update an existing install rather than fail.
 # WinSW v2 has no in-place "refresh" command (that arrived in v3), so to apply
