@@ -108,9 +108,10 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\install.ps1
 ```
 
-When the service already exists, the script runs `uv sync`, refreshes the service
-config, and restarts the service (instead of failing on a duplicate install). It
-also re-stamps the service **description** with the current commit, e.g.:
+When the service already exists, the script runs `uv sync`, then stops,
+uninstalls, and reinstalls the service so the latest config takes effect (WinSW
+v2 has no in-place refresh), instead of failing on a duplicate install. It also
+re-stamps the service **description** with the current commit, e.g.:
 
 ```
 Replicates MongoDB Atlas data into Microsoft Fabric OneLake in near real time. (build a1b2c3d, installed 2026-06-18 09:30 UTC)

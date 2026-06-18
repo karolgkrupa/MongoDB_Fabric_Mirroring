@@ -119,36 +119,35 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
     Write-Warning "git not found; service description left unchanged."
 }
 
-# --- 4. Install (first run) or update (re-run) the service ------------------
-# Re-running this script should update an existing install rather than fail, so
-# we branch on whether the service is already registered. `refresh` re-applies
-# the .xml (e.g. the new description above) to the registered service, and the
-# stop/start picks up the latest code from the working directory.
+# --- 4. (Re)install and start the service -----------------------------------
+# Re-running this script should update an existing install rather than fail.
+# WinSW v2 has no in-place "refresh" command (that arrived in v3), so to apply
+# any .xml changes (including the description stamp above) we stop and uninstall
+# the existing service, then install it fresh.
 $existing = Get-Service -Name $ServiceId -ErrorAction SilentlyContinue
 if ($existing) {
-    Write-Host "Service '$ServiceId' already exists; updating it..." -ForegroundColor Cyan
-    & $WinSwExe refresh $WinSwConfig
-    if ($LASTEXITCODE -ne 0) { throw "WinSW refresh failed with exit code $LASTEXITCODE." }
-
-    Write-Host "Restarting the service to pick up the latest code and config..." -ForegroundColor Cyan
-    # Stop first (ignore failure if it's already stopped), then start, so this
-    # works regardless of the service's current state.
+    Write-Host "Service '$ServiceId' already exists; reinstalling to apply the latest config..." -ForegroundColor Cyan
     & $WinSwExe stop $WinSwConfig
-    & $WinSwExe start $WinSwConfig
-    if ($LASTEXITCODE -ne 0) { throw "WinSW start failed with exit code $LASTEXITCODE." }
+    # Ignore a non-zero stop exit code: the service may already be stopped.
+    & $WinSwExe uninstall $WinSwConfig
+    if ($LASTEXITCODE -ne 0) { throw "WinSW uninstall failed with exit code $LASTEXITCODE." }
+    # Give the Service Control Manager a moment to fully deregister the service so
+    # the install below doesn't hit a "service marked for deletion" error.
+    Start-Sleep -Seconds 3
+}
 
-    Write-Host ""
-    Write-Host "Done. The '$ServiceId' service has been updated and restarted." -ForegroundColor Green
+Write-Host "Installing the Windows service '$ServiceId'..." -ForegroundColor Cyan
+& $WinSwExe install $WinSwConfig
+if ($LASTEXITCODE -ne 0) { throw "WinSW install failed with exit code $LASTEXITCODE." }
+
+Write-Host "Starting the service..." -ForegroundColor Cyan
+& $WinSwExe start $WinSwConfig
+if ($LASTEXITCODE -ne 0) { throw "WinSW start failed with exit code $LASTEXITCODE." }
+
+Write-Host ""
+if ($existing) {
+    Write-Host "Done. The '$ServiceId' service has been updated (reinstalled) and restarted." -ForegroundColor Green
 } else {
-    Write-Host "Installing the Windows service '$ServiceId'..." -ForegroundColor Cyan
-    & $WinSwExe install $WinSwConfig
-    if ($LASTEXITCODE -ne 0) { throw "WinSW install failed with exit code $LASTEXITCODE." }
-
-    Write-Host "Starting the service..." -ForegroundColor Cyan
-    & $WinSwExe start $WinSwConfig
-    if ($LASTEXITCODE -ne 0) { throw "WinSW start failed with exit code $LASTEXITCODE." }
-
-    Write-Host ""
     Write-Host "Done. The '$ServiceId' service is installed and set to start automatically on boot." -ForegroundColor Green
 }
 Write-Host "Logs:        $LogsDir" -ForegroundColor Green
