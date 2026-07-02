@@ -1,6 +1,9 @@
 import os
 import pickle
+import logging
 from constants import DATA_FILES_PATH, FILE_NAME_LENGTH, SCHEMA_VERSION_DIR_NAME
+
+logger = logging.getLogger(__name__)
 
 
 def to_string(obj) -> str:
@@ -25,8 +28,15 @@ def get_schema_version(collection_name: str) -> int:
     path = _schema_version_file_path(collection_name)
     if not os.path.exists(path):
         return 1
-    with open(path, "rb") as f:
-        return pickle.load(f)
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except (EOFError, pickle.UnpicklingError, AttributeError, ImportError, ModuleNotFoundError) as e:
+        logger.error(
+            f"Corrupted schema version file for {collection_name} at {path}: "
+            f"{type(e).__name__}: {e}. Defaulting to version 1."
+        )
+        return 1
 
 
 def set_schema_version(collection_name: str, version: int) -> None:
@@ -77,6 +87,26 @@ def get_temp_parquet_full_path_filename(table_name: str, prefix: str = "") -> st
         return os.path.join(table_dir, prefix + __num_to_filename(max(tmp_parquet_filename_int_list) + 1))
     else:
         return os.path.join(table_dir, prefix + __num_to_filename(1))
+
+
+def get_last_parquet_file_num_from_existing_files(table_name: str) -> int:
+    """Fallback used when the persisted parquet-file counter (LAST_PARQUET_FILE_NUMBER)
+    is missing or corrupted. Rather than blindly restarting at 0 - which risks
+    generating a filename that collides with/overwrites a numbered parquet file
+    already uploaded to the Landing Zone - derive the last-used number from the
+    highest-numbered *.parquet file still present in the local table directory
+    (old numbered files are pruned down to the latest one after a successful
+    push, see push_file_to_lz.__clean_up_old_parquet_files).
+    Returns 0 (i.e. "nothing written yet") if no numbered parquet file is found.
+    """
+    table_dir = get_table_dir(table_name)
+    existing_numbered_files = [
+        int(os.path.splitext(filename)[0])
+        for filename in os.listdir(table_dir)
+        if os.path.splitext(filename)[1] == ".parquet"
+        and os.path.splitext(filename)[0].isnumeric()
+    ]
+    return max(existing_numbered_files) if existing_numbered_files else 0
 
 
 def __num_to_filename(num: int) -> str:

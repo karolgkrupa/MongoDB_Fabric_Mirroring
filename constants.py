@@ -55,6 +55,11 @@ DELTA_SYNC_CACHE_PARQUET_FILE_NAME = "_incremental_change_cache.parquet"
 
 DELTA_SYNC_RESUME_TOKEN_FILE_NAME = "_resume_token.pkl"
 
+# Backup copy of the resume token, kept one checkpoint behind the primary so a
+# corrupted primary can still be recovered from a recent, valid value instead
+# of losing continuity entirely (see file_utils.read_from_file_with_backup).
+DELTA_SYNC_RESUME_TOKEN_BACKUP_FILE_NAME = "_resume_token.pkl.bak"
+
 INTERNAL_SCHEMA_FILE_NAME = "_internal_schema.pkl"
 
 COLUMN_RENAMING_FILE_NAME = "_column_renaming.pkl"

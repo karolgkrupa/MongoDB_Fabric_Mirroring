@@ -105,6 +105,9 @@ def __patch_file(access_token, file_path, lz_url, table_name):
         # Code to create file in lakehouse
         response = requests.put(token_url_temp, data={}, headers=token_headers)
         logger.debug(response)
+        # Do not proceed to append/rename if the temp file couldn't even be created,
+        # otherwise a stale/empty file could later get renamed over a good checkpoint.
+        response.raise_for_status()
 
         token_url_temp = base_url + file_name_temp + '_TEMP' + "?position=0&action=append&flush=true"
         token_headers = {
@@ -120,6 +123,9 @@ def __patch_file(access_token, file_path, lz_url, table_name):
             file_contents = file.read()
             response = requests.patch(token_url_temp, data=file_contents, headers=token_headers)
         logger.debug(response)
+        # A failed or partial append must never be promoted to the live file via rename,
+        # otherwise the rename would replace a good checkpoint with an empty/corrupt one.
+        response.raise_for_status()
 
         # Rename file from temp to actual name
         token_headers = {
@@ -129,6 +135,7 @@ def __patch_file(access_token, file_path, lz_url, table_name):
         }
         response = requests.put(token_url, headers=token_headers)
         logger.debug(response)
+        response.raise_for_status()
     except Exception as e:
         logger.error(f"Error patching file to landing zone: {str(e)}")
         raise

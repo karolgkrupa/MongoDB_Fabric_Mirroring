@@ -18,6 +18,7 @@ from constants import (
     DATA_FILES_PATH,
     DELTA_SYNC_CACHE_PARQUET_FILE_NAME,
     DELTA_SYNC_RESUME_TOKEN_FILE_NAME,
+    DELTA_SYNC_RESUME_TOKEN_BACKUP_FILE_NAME,
 # added the two new files to save the initial sync status and last parquet file number
     INIT_SYNC_STATUS_FILE_NAME,
     LAST_PARQUET_FILE_NUMBER,
@@ -28,6 +29,7 @@ from utils import (
     to_string,
     get_parquet_full_path_filename,
     get_temp_parquet_full_path_filename,
+    get_last_parquet_file_num_from_existing_files,
     get_table_dir,
     get_schema_version,
     set_schema_version,
@@ -37,7 +39,7 @@ from push_file_to_lz import push_file_to_lz, push_table_metadata_files
 from init_sync import init_sync
 import schemas
 import schema_utils
-from file_utils import FileType, read_from_file, write_to_file
+from file_utils import FileType, read_from_file, write_to_file, read_from_file_with_backup
 
 def listening(collection_name: str):
     logger = logging.getLogger(f"{__name__}[{collection_name}]")
@@ -49,12 +51,39 @@ def listening(collection_name: str):
     post_init_flush_done = False
 
     # table_dir = get_table_dir(collection_name) #Never used
-    resume_token = read_from_file(
-        collection_name, DELTA_SYNC_RESUME_TOKEN_FILE_NAME, FileType.PICKLE
+    resume_token, used_backup_resume_token, primary_resume_token_corrupted = read_from_file_with_backup(
+        collection_name,
+        DELTA_SYNC_RESUME_TOKEN_FILE_NAME,
+        DELTA_SYNC_RESUME_TOKEN_BACKUP_FILE_NAME,
+        FileType.PICKLE,
     )
+    # While True, plain "insert" events are persisted with the Upsert row marker
+    # instead of Insert, so that any already-processed changes replayed from a
+    # backup/stale checkpoint get merged instead of duplicated. Cleared once a
+    # fresh resume_token checkpoint is successfully written again.
+    recovering_from_backup_token = False
     if resume_token:
-        logger.info(
-            f"interrupted incremental sync detected, continuing with resume_token={resume_token}"
+        if used_backup_resume_token:
+            recovering_from_backup_token = True
+            logger.warning(
+                "resume_token for collection %s recovered from BACKUP checkpoint (primary was "
+                "corrupted): resume_token=%s. Some already-processed changes may be replayed; "
+                "they will be upserted (not duplicated) until the next successful checkpoint.",
+                collection_name,
+                resume_token,
+            )
+        else:
+            logger.info(
+                f"interrupted incremental sync detected, continuing with resume_token={resume_token}"
+            )
+    elif primary_resume_token_corrupted:
+        logger.critical(
+            "DATA CONTINUITY RISK: resume_token for collection %s could not be recovered from "
+            "either the primary or backup checkpoint (both corrupted/unreadable). The change "
+            "stream will resume from 'now' - any changes since the last known-good checkpoint "
+            "may be skipped. Inspect the corrupted checkpoint copies saved under the collection's "
+            ".corrupt/ folder.",
+            collection_name,
         )
 
     #MongoDB connection and data info
@@ -114,7 +143,7 @@ def listening(collection_name: str):
                             and init_sync_stat_flag == "Y"
                             and last_sync_time is not None
                         ):
-                            accumulative_df, last_sync_time = process_accumulative_df(
+                            accumulative_df, last_sync_time, recovering_from_backup_token = process_accumulative_df(
                                 accumulative_df,
                                 collection_name,
                                 init_sync_stat_flag,
@@ -122,6 +151,7 @@ def listening(collection_name: str):
                                 time_threshold_in_sec,
                                 resume_token,
                                 logger,
+                                recovering_from_backup_token,
                             )
                         continue
 
@@ -168,7 +198,7 @@ def listening(collection_name: str):
                             schema_change_signal.expected_type,
                             schema_change_signal.actual_type,
                         )
-                        accumulative_df, last_sync_time = __bump_schema_version(
+                        accumulative_df, last_sync_time, recovering_from_backup_token = __bump_schema_version(
                             collection_name,
                             accumulative_df,
                             resume_token,
@@ -177,6 +207,7 @@ def listening(collection_name: str):
                             time_threshold_in_sec,
                             doc,
                             logger,
+                            recovering_from_backup_token,
                         )
                         continue
 
@@ -188,6 +219,16 @@ def listening(collection_name: str):
                         row_marker_value = CHANGE_STREAM_OPERATION_MAP_WHEN_INIT[
                             operationType
                         ]
+                    elif recovering_from_backup_token and operationType == "insert":
+                        # Replaying from a backup/stale resume_token may redeliver changes we
+                        # already processed. A plain Insert would duplicate the row, so use
+                        # Upsert instead until a fresh checkpoint closes the replay window.
+                        logger.debug(
+                            "collection %s replaying insert while recovering from backup "
+                            "resume_token; using UPSERT instead of INSERT",
+                            collection_name,
+                        )
+                        row_marker_value = CHANGE_STREAM_OPERATION_MAP_WHEN_INIT["insert"]
                     else:
                         row_marker_value = CHANGE_STREAM_OPERATION_MAP[operationType]
 
@@ -210,7 +251,7 @@ def listening(collection_name: str):
                             "last_sync_time when first record added: %s", last_sync_time
                         )
 
-                    accumulative_df, last_sync_time = process_accumulative_df(
+                    accumulative_df, last_sync_time, recovering_from_backup_token = process_accumulative_df(
                         accumulative_df,
                         collection_name,
                         init_sync_stat_flag,
@@ -218,6 +259,7 @@ def listening(collection_name: str):
                         time_threshold_in_sec,
                         resume_token,
                         logger,
+                        recovering_from_backup_token,
                     )
 
                 # End inner while True
@@ -238,9 +280,10 @@ def listening(collection_name: str):
             )
 
             if is_non_resumable:
-                logger.error(
-                    "Non-resumable Change Stream error (ChangeStreamHistoryLost) for collection %s: %s. "
-                    "Clearing resume token and restarting from latest position.",
+                logger.critical(
+                    "DATA CONTINUITY RISK: Non-resumable Change Stream error (ChangeStreamHistoryLost) "
+                    "for collection %s: %s. Clearing resume token and restarting from latest position - "
+                    "any changes between the last known-good checkpoint and now may be skipped.",
                     collection_name,
                     exc,
                     exc_info=True,
@@ -248,12 +291,21 @@ def listening(collection_name: str):
 
                 # Drop the bad resume token so the next loop does *not* send resume_after.
                 resume_token = None
+                # No longer meaningful once we're intentionally resetting to "now".
+                recovering_from_backup_token = False
 
-                # Persist that change so a restart doesn't reuse the stale token.
+                # Persist that change so a restart doesn't reuse the stale token. Clear the
+                # backup too, since resuming from it later would be just as unsafe/stale.
                 write_to_file(
                     None,
                     collection_name,
                     DELTA_SYNC_RESUME_TOKEN_FILE_NAME,
+                    FileType.PICKLE,
+                )
+                write_to_file(
+                    None,
+                    collection_name,
+                    DELTA_SYNC_RESUME_TOKEN_BACKUP_FILE_NAME,
                     FileType.PICKLE,
                 )
 
@@ -288,7 +340,7 @@ def listening(collection_name: str):
             continue
 
 ##>> enhancement to check time elapsed even if no event comes - no waiting indefinitely for a change
-def process_accumulative_df(accumulative_df, collection_name, init_sync_stat_flag, last_sync_time, time_threshold_in_sec, resume_token, logger, force_flush=False):
+def process_accumulative_df(accumulative_df, collection_name, init_sync_stat_flag, last_sync_time, time_threshold_in_sec, resume_token, logger, recovering_from_backup_token=False, force_flush=False):
     if not init_sync_stat_flag == "Y":
         if (accumulative_df is not None
             and (
@@ -316,7 +368,7 @@ def process_accumulative_df(accumulative_df, collection_name, init_sync_stat_fla
                     collection_name, LAST_PARQUET_FILE_NUMBER, FileType.PICKLE
                 )
                 if not last_parquet_file_num:
-                    last_parquet_file_num = 0
+                    last_parquet_file_num = get_last_parquet_file_num_from_existing_files(collection_name)
 
                 parquet_full_path_filename = get_parquet_full_path_filename(collection_name, last_parquet_file_num)
 
@@ -340,7 +392,15 @@ def process_accumulative_df(accumulative_df, collection_name, init_sync_stat_fla
                     collection_name,
                     DELTA_SYNC_RESUME_TOKEN_FILE_NAME,
                     FileType.PICKLE,
+                    backup_file_name=DELTA_SYNC_RESUME_TOKEN_BACKUP_FILE_NAME,
                 )
+                if recovering_from_backup_token:
+                    logger.info(
+                        "resume_token checkpoint for collection %s successfully refreshed; "
+                        "exiting backup-recovery replay window, resuming normal insert row markers.",
+                        collection_name,
+                    )
+                    recovering_from_backup_token = False
                 last_parquet_file_num +=  1
                 logger.info(f"writing last parquet number into file: {last_parquet_file_num}")
                 write_to_file(
@@ -349,7 +409,7 @@ def process_accumulative_df(accumulative_df, collection_name, init_sync_stat_fla
                     LAST_PARQUET_FILE_NUMBER,
                     FileType.PICKLE,
             )
-    return accumulative_df, last_sync_time
+    return accumulative_df, last_sync_time, recovering_from_backup_token
 
 def __bump_schema_version(
     collection_name,
@@ -360,13 +420,14 @@ def __bump_schema_version(
     time_threshold_in_sec,
     offending_doc,
     logger,
+    recovering_from_backup_token=False,
 ):
     # 1. Flush whatever is currently accumulated into the OLD versioned folder so
     # no buffered rows are lost across the boundary. The offending doc isn't in
     # accumulative_df yet (the signal returned before the concat step), so the
     # flush cleanly contains only docs that match the old schema.
     if accumulative_df is not None:
-        accumulative_df, last_sync_time = process_accumulative_df(
+        accumulative_df, last_sync_time, recovering_from_backup_token = process_accumulative_df(
             accumulative_df,
             collection_name,
             init_sync_stat_flag,
@@ -374,6 +435,7 @@ def __bump_schema_version(
             time_threshold_in_sec,
             resume_token,
             logger,
+            recovering_from_backup_token,
             force_flush=True,
         )
 
@@ -399,7 +461,15 @@ def __bump_schema_version(
         collection_name,
         DELTA_SYNC_RESUME_TOKEN_FILE_NAME,
         FileType.PICKLE,
+        backup_file_name=DELTA_SYNC_RESUME_TOKEN_BACKUP_FILE_NAME,
     )
+    if recovering_from_backup_token:
+        logger.info(
+            "resume_token checkpoint for collection %s refreshed during schema-version bump; "
+            "exiting backup-recovery replay window.",
+            collection_name,
+        )
+        recovering_from_backup_token = False
     write_to_file(
         init_sync_stat_flag,
         collection_name,
@@ -422,7 +492,7 @@ def __bump_schema_version(
     # underlying Mongo operationType.
     new_df.insert(0, ROW_MARKER_COLUMN_NAME, [CHANGE_STREAM_OPERATION_MAP["insert"]])
 
-    return new_df, time.time()
+    return new_df, time.time(), recovering_from_backup_token
 
 
 def __post_init_flush(table_name: str, logger):
@@ -449,7 +519,7 @@ def __post_init_flush(table_name: str, logger):
             table_name, LAST_PARQUET_FILE_NUMBER, FileType.PICKLE
         )
         if not last_parquet_file_num:
-            last_parquet_file_num = 0
+            last_parquet_file_num = get_last_parquet_file_num_from_existing_files(table_name)
         new_parquet_full_path = get_parquet_full_path_filename(table_name, last_parquet_file_num)   
         logger.debug("renaming temp parquet file")
         logger.debug(f"old name: {temp_parquet_full_path}")
