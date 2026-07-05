@@ -48,6 +48,10 @@ def listening(collection_name: str):
     logger.debug(f"collection={collection_name}")
     # moved listening method so that it is called after the env variables are loaded
     time_threshold_in_sec = float(os.getenv("TIME_THRESHOLD_IN_SEC"))
+    # How long a "resumable" change stream error is allowed to keep recurring (with
+    # the same stale resume_token) before we give up and treat it like a
+    # non-resumable error instead of retrying forever. Default: 5 minutes.
+    resumable_error_max_retry_sec = float(os.getenv("RESUMABLE_ERROR_MAX_RETRY_SEC", "300"))
     post_init_flush_done = False
 
     # table_dir = get_table_dir(collection_name) #Never used
@@ -104,6 +108,10 @@ def listening(collection_name: str):
     accumulative_df: pd.DataFrame = None
     init_sync_stat_flag = None
     last_sync_time: float | None = None
+    # Tracks how long we've been continuously failing with a "resumable" change
+    # stream error. None means no active failure streak. Reset on any successful
+    # try_next() call (proof the stream is currently healthy).
+    resumable_failure_streak_start: float | None = None
 
     # start init sync after we get cursor from Change Stream
     Thread(target=init_sync, args=(collection_name,)).start()
@@ -132,6 +140,8 @@ def listening(collection_name: str):
                     before = time.time()
                     change = stream.try_next()
                     after = time.time()
+                    # Forward progress made; any ongoing resumable-error streak is over.
+                    resumable_failure_streak_start = None
 
                     if change is None:
                         if (datetime.now() - last_action_time >= timedelta(minutes=5)):
@@ -279,6 +289,29 @@ def listening(collection_name: str):
                 )
             )
 
+            if not is_non_resumable:
+                # Track how long this "resumable" error has kept recurring without any
+                # forward progress. A permanently-stale resume_token (e.g. after a
+                # replica-set key rotation) can look resumable but never actually
+                # succeed, so retrying forever with the same token would leave the
+                # collection stuck indefinitely.
+                now = time.time()
+                if resumable_failure_streak_start is None:
+                    resumable_failure_streak_start = now
+                elif now - resumable_failure_streak_start >= resumable_error_max_retry_sec:
+                    logger.critical(
+                        "DATA CONTINUITY RISK: resumable change stream error for collection %s "
+                        "has been recurring for over %.0fs with no forward progress "
+                        "(resume_token=%s); escalating to a non-resumable reset instead of "
+                        "retrying forever.",
+                        collection_name,
+                        resumable_error_max_retry_sec,
+                        resume_token,
+                        exc_info=True,
+                    )
+                    is_non_resumable = True
+                    resumable_failure_streak_start = None
+
             if is_non_resumable:
                 logger.critical(
                     "DATA CONTINUITY RISK: Non-resumable Change Stream error (ChangeStreamHistoryLost) "
@@ -328,6 +361,23 @@ def listening(collection_name: str):
             time.sleep(2)
             continue
 
+        except Exception as exc:
+            # Last-resort safety net for anything not already handled above (e.g. an
+            # HTTP failure raised out of push_file_to_lz via __bump_schema_version, or
+            # any other unexpected error). Without this, an uncaught exception here
+            # would be handled by Python's *default* thread exception hook, which
+            # prints to stderr only and never reaches mirroring.log - silently ending
+            # this collection's sync with no trace in the log anyone would check.
+            logger.critical(
+                "DATA CONTINUITY RISK: unexpected error in listening loop for collection %s: %s. "
+                "Thread will keep running and retry rather than dying silently.",
+                collection_name,
+                exc,
+                exc_info=True,
+            )
+            time.sleep(2)
+            continue
+
         # If we ever exit the inner loop *without* an exception:
         # check stream.alive to see if the server closed the cursor.
         if not stream.alive:
@@ -348,13 +398,24 @@ def process_accumulative_df(accumulative_df, collection_name, init_sync_stat_fla
                 or (accumulative_df.shape[0] >= int(os.getenv("DELTA_SYNC_BATCH_SIZE")))
             )
         ):
-            prefix = TEMP_PREFIX_DURING_INIT
-            parquet_full_path_filename = get_temp_parquet_full_path_filename(
-                collection_name, prefix=prefix
-            )
-            logger.info(f"writing TEMP parquet file: {parquet_full_path_filename}")
-            accumulative_df.to_parquet(parquet_full_path_filename)
-            accumulative_df = None
+            try:
+                prefix = TEMP_PREFIX_DURING_INIT
+                parquet_full_path_filename = get_temp_parquet_full_path_filename(
+                    collection_name, prefix=prefix
+                )
+                logger.info(f"writing TEMP parquet file: {parquet_full_path_filename}")
+                accumulative_df.to_parquet(parquet_full_path_filename)
+                accumulative_df = None
+            except Exception as exc:
+                # Never let a write failure here silently kill the listening thread -
+                # keep the batch in memory so the next check retries the whole write.
+                logger.critical(
+                    "DATA CONTINUITY RISK: failed to write TEMP parquet file for collection %s: "
+                    "%s. Batch retained in memory and will be retried.",
+                    collection_name,
+                    exc,
+                    exc_info=True,
+                )
     else:
         if (accumulative_df is not None
         ):
@@ -363,52 +424,64 @@ def process_accumulative_df(accumulative_df, collection_name, init_sync_stat_fla
                 or (accumulative_df.shape[0] >= int(os.getenv("DELTA_SYNC_BATCH_SIZE")))
                 or ((time.time() - last_sync_time) >= time_threshold_in_sec)
             ):
-                prefix = ""
-                last_parquet_file_num = read_from_file(
-                    collection_name, LAST_PARQUET_FILE_NUMBER, FileType.PICKLE
-                )
-                if not last_parquet_file_num:
-                    last_parquet_file_num = get_last_parquet_file_num_from_existing_files(collection_name)
-
-                parquet_full_path_filename = get_parquet_full_path_filename(collection_name, last_parquet_file_num)
-
-                logger.info(f"writing parquet file: {parquet_full_path_filename}")
-                # Convert any remaining Object column into String
-                id_col = accumulative_df['_id']
-                obj_cols = accumulative_df.select_dtypes(include=['object']).columns
-                accumulative_df[obj_cols] = accumulative_df[obj_cols].astype(str,errors="ignore")
-                
-                #  Restore the _id column
-                accumulative_df['_id'] = id_col
-                # Write the parquet file
-                accumulative_df.to_parquet(parquet_full_path_filename)
-                accumulative_df = None
-
-                push_file_to_lz(parquet_full_path_filename, collection_name)
-            #    resume_token = change["_id"]
-                logger.info(f"writing resume_token into file: {resume_token}")
-                write_to_file(
-                    resume_token,
-                    collection_name,
-                    DELTA_SYNC_RESUME_TOKEN_FILE_NAME,
-                    FileType.PICKLE,
-                    backup_file_name=DELTA_SYNC_RESUME_TOKEN_BACKUP_FILE_NAME,
-                )
-                if recovering_from_backup_token:
-                    logger.info(
-                        "resume_token checkpoint for collection %s successfully refreshed; "
-                        "exiting backup-recovery replay window, resuming normal insert row markers.",
-                        collection_name,
+                try:
+                    prefix = ""
+                    last_parquet_file_num = read_from_file(
+                        collection_name, LAST_PARQUET_FILE_NUMBER, FileType.PICKLE
                     )
-                    recovering_from_backup_token = False
-                last_parquet_file_num +=  1
-                logger.info(f"writing last parquet number into file: {last_parquet_file_num}")
-                write_to_file(
-                    last_parquet_file_num,
-                    collection_name,
-                    LAST_PARQUET_FILE_NUMBER,
-                    FileType.PICKLE,
-            )
+                    if not last_parquet_file_num:
+                        last_parquet_file_num = get_last_parquet_file_num_from_existing_files(collection_name)
+
+                    parquet_full_path_filename = get_parquet_full_path_filename(collection_name, last_parquet_file_num)
+
+                    logger.info(f"writing parquet file: {parquet_full_path_filename}")
+                    # Convert any remaining Object column into String
+                    id_col = accumulative_df['_id']
+                    obj_cols = accumulative_df.select_dtypes(include=['object']).columns
+                    accumulative_df[obj_cols] = accumulative_df[obj_cols].astype(str,errors="ignore")
+
+                    #  Restore the _id column
+                    accumulative_df['_id'] = id_col
+                    # Write the parquet file
+                    accumulative_df.to_parquet(parquet_full_path_filename)
+
+                    push_file_to_lz(parquet_full_path_filename, collection_name)
+                #    resume_token = change["_id"]
+                    logger.info(f"writing resume_token into file: {resume_token}")
+                    write_to_file(
+                        resume_token,
+                        collection_name,
+                        DELTA_SYNC_RESUME_TOKEN_FILE_NAME,
+                        FileType.PICKLE,
+                        backup_file_name=DELTA_SYNC_RESUME_TOKEN_BACKUP_FILE_NAME,
+                    )
+                    last_parquet_file_num +=  1
+                    logger.info(f"writing last parquet number into file: {last_parquet_file_num}")
+                    write_to_file(
+                        last_parquet_file_num,
+                        collection_name,
+                        LAST_PARQUET_FILE_NUMBER,
+                        FileType.PICKLE,
+                    )
+                    # Only clear the batch (and the backup-recovery flag) once every write/push
+                    # above has actually succeeded - otherwise a mid-flush failure would
+                    # silently drop the batch instead of retrying it.
+                    accumulative_df = None
+                    if recovering_from_backup_token:
+                        logger.info(
+                            "resume_token checkpoint for collection %s successfully refreshed; "
+                            "exiting backup-recovery replay window, resuming normal insert row markers.",
+                            collection_name,
+                        )
+                        recovering_from_backup_token = False
+                except Exception as exc:
+                    logger.critical(
+                        "DATA CONTINUITY RISK: failed to flush/push batch for collection %s: %s. "
+                        "Batch retained in memory and will be retried on the next flush attempt.",
+                        collection_name,
+                        exc,
+                        exc_info=True,
+                    )
     return accumulative_df, last_sync_time, recovering_from_backup_token
 
 def __bump_schema_version(
@@ -513,28 +586,41 @@ def __post_init_flush(table_name: str, logger):
     )
     for temp_parquet_filename in temp_parquet_filename_list:
         temp_parquet_full_path = os.path.join(table_dir, temp_parquet_filename)
-        # changed to get last parquet file number from LZ for resilience
-        #new_parquet_full_path = get_parquet_full_path_filename(table_name)
-        last_parquet_file_num = read_from_file(
-            table_name, LAST_PARQUET_FILE_NUMBER, FileType.PICKLE
-        )
-        if not last_parquet_file_num:
-            last_parquet_file_num = get_last_parquet_file_num_from_existing_files(table_name)
-        new_parquet_full_path = get_parquet_full_path_filename(table_name, last_parquet_file_num)   
-        logger.debug("renaming temp parquet file")
-        logger.debug(f"old name: {temp_parquet_full_path}")
-        logger.debug(f"new name: {new_parquet_full_path}")
-        logger.info(
-            f"renaming parquet file from {temp_parquet_full_path} to {new_parquet_full_path}"
-        )
-        os.rename(temp_parquet_full_path, new_parquet_full_path)
-        push_file_to_lz(new_parquet_full_path, table_name)
-        # write last parquet file number to file
-        last_parquet_file_num +=  1
-        logger.info(f"writing last parquet number into file: {last_parquet_file_num}")
-        write_to_file(
-            last_parquet_file_num,
-            table_name,
-            LAST_PARQUET_FILE_NUMBER,
-            FileType.PICKLE,
-        )
+        try:
+            # changed to get last parquet file number from LZ for resilience
+            #new_parquet_full_path = get_parquet_full_path_filename(table_name)
+            last_parquet_file_num = read_from_file(
+                table_name, LAST_PARQUET_FILE_NUMBER, FileType.PICKLE
+            )
+            if not last_parquet_file_num:
+                last_parquet_file_num = get_last_parquet_file_num_from_existing_files(table_name)
+            new_parquet_full_path = get_parquet_full_path_filename(table_name, last_parquet_file_num)
+            logger.debug("renaming temp parquet file")
+            logger.debug(f"old name: {temp_parquet_full_path}")
+            logger.debug(f"new name: {new_parquet_full_path}")
+            logger.info(
+                f"renaming parquet file from {temp_parquet_full_path} to {new_parquet_full_path}"
+            )
+            os.rename(temp_parquet_full_path, new_parquet_full_path)
+            push_file_to_lz(new_parquet_full_path, table_name)
+            # write last parquet file number to file
+            last_parquet_file_num +=  1
+            logger.info(f"writing last parquet number into file: {last_parquet_file_num}")
+            write_to_file(
+                last_parquet_file_num,
+                table_name,
+                LAST_PARQUET_FILE_NUMBER,
+                FileType.PICKLE,
+            )
+        except Exception as exc:
+            # Don't let one bad temp file abort the rest of the post-init flush (or
+            # take the whole listening thread down with it).
+            logger.critical(
+                "DATA CONTINUITY RISK: failed to flush temp parquet file %s for collection %s: "
+                "%s. Skipping to the next temp file; this file will need manual recovery.",
+                temp_parquet_full_path,
+                table_name,
+                exc,
+                exc_info=True,
+            )
+            continue

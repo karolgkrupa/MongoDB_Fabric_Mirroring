@@ -20,3 +20,11 @@ dependencies = [
 # not built/installed as a distributable package. Treat it as a virtual project so
 # `uv sync` only manages the dependency environment in .venv.
 package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

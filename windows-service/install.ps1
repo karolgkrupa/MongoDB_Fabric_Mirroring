@@ -62,7 +62,7 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 Write-Host "Syncing Python environment with uv (this also installs Python 3.14 if needed)..." -ForegroundColor Cyan
 Push-Location $RepoRoot
 try {
-    uv sync
+    uv sync --no-dev
     if ($LASTEXITCODE -ne 0) { throw "uv sync failed with exit code $LASTEXITCODE." }
 }
 finally {
