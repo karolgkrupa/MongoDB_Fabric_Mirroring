@@ -136,3 +136,71 @@ def test_clean_up_old_parquet_files_noop_for_prefixed_file(tmp_path):
 
     remaining = set(os.listdir(tmp_path))
     assert remaining == set(filenames)
+
+
+# ---------------------------------------------------------------------------
+# list_files_in_lz / get_last_parquet_file_num_from_lz
+# ---------------------------------------------------------------------------
+
+def test_list_files_in_lz_returns_file_basenames(monkeypatch, make_response):
+    monkeypatch.setattr(push_file_to_lz, "__get_access_token", lambda *a, **k: "token")
+    paths_json = {
+        "paths": [
+            {"name": "MirrorDB/Files/LandingZone/mycol/00000000000000000001.parquet"},
+            {"name": "MirrorDB/Files/LandingZone/mycol/00000000000000000002.parquet"},
+            # Directories (isDirectory="true") must be excluded.
+            {"name": "MirrorDB/Files/LandingZone/mycol/subdir", "isDirectory": "true"},
+        ]
+    }
+    monkeypatch.setattr(
+        push_file_to_lz.requests, "get",
+        lambda url, headers=None: make_response(200, json_data=paths_json),
+    )
+
+    files = push_file_to_lz.list_files_in_lz("mycol")
+
+    assert files == ["00000000000000000001.parquet", "00000000000000000002.parquet"]
+
+
+def test_list_files_in_lz_returns_empty_on_non_200(monkeypatch, make_response):
+    monkeypatch.setattr(push_file_to_lz, "__get_access_token", lambda *a, **k: "token")
+    monkeypatch.setattr(
+        push_file_to_lz.requests, "get",
+        lambda url, headers=None: make_response(404),
+    )
+
+    assert push_file_to_lz.list_files_in_lz("mycol") == []
+
+
+def test_list_files_in_lz_returns_empty_on_exception(monkeypatch):
+    monkeypatch.setattr(push_file_to_lz, "__get_access_token", lambda *a, **k: "token")
+
+    def boom(url, headers=None):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(push_file_to_lz.requests, "get", boom)
+
+    # Best-effort: any failure degrades to an empty listing (start numbering at 1).
+    assert push_file_to_lz.list_files_in_lz("mycol") == []
+
+
+def test_get_last_parquet_file_num_from_lz_returns_max_numbered(monkeypatch):
+    monkeypatch.setattr(
+        push_file_to_lz, "list_files_in_lz",
+        lambda table: [
+            "00000000000000000001.parquet",
+            "00000000000000000005.parquet",
+            "00000000000000000003.parquet",
+            # Non-numeric / prefixed / non-parquet entries must be ignored.
+            "_metadata.json",
+            "Temp_00000009.parquet",
+        ],
+    )
+
+    assert push_file_to_lz.get_last_parquet_file_num_from_lz("mycol") == 5
+
+
+def test_get_last_parquet_file_num_from_lz_empty_lz_returns_0(monkeypatch):
+    monkeypatch.setattr(push_file_to_lz, "list_files_in_lz", lambda table: [])
+
+    assert push_file_to_lz.get_last_parquet_file_num_from_lz("mycol") == 0

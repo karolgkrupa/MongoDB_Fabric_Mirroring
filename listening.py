@@ -29,12 +29,15 @@ from utils import (
     to_string,
     get_parquet_full_path_filename,
     get_temp_parquet_full_path_filename,
-    get_last_parquet_file_num_from_existing_files,
     get_table_dir,
     get_schema_version,
     set_schema_version,
 )
-from push_file_to_lz import push_file_to_lz, push_table_metadata_files
+from push_file_to_lz import (
+    push_file_to_lz,
+    push_table_metadata_files,
+    get_last_parquet_file_num_from_lz,
+)
 #from flags import get_init_flag
 from init_sync import init_sync
 import schemas
@@ -430,7 +433,7 @@ def process_accumulative_df(accumulative_df, collection_name, init_sync_stat_fla
                         collection_name, LAST_PARQUET_FILE_NUMBER, FileType.PICKLE
                     )
                     if not last_parquet_file_num:
-                        last_parquet_file_num = get_last_parquet_file_num_from_existing_files(collection_name)
+                        last_parquet_file_num = get_last_parquet_file_num_from_lz(collection_name)
 
                     parquet_full_path_filename = get_parquet_full_path_filename(collection_name, last_parquet_file_num)
 
@@ -593,7 +596,7 @@ def __post_init_flush(table_name: str, logger):
                 table_name, LAST_PARQUET_FILE_NUMBER, FileType.PICKLE
             )
             if not last_parquet_file_num:
-                last_parquet_file_num = get_last_parquet_file_num_from_existing_files(table_name)
+                last_parquet_file_num = get_last_parquet_file_num_from_lz(table_name)
             new_parquet_full_path = get_parquet_full_path_filename(table_name, last_parquet_file_num)
             logger.debug("renaming temp parquet file")
             logger.debug(f"old name: {temp_parquet_full_path}")

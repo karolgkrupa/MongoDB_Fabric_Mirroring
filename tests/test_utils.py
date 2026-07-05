@@ -89,23 +89,3 @@ def test_get_temp_parquet_full_path_filename_continues_from_max_existing():
     third_path = utils.get_temp_parquet_full_path_filename("mycol", prefix="Temp_")
     stem = os.path.splitext(os.path.basename(third_path))[0].removeprefix("Temp_")
     assert int(stem) == 3
-
-
-# ---------------------------------------------------------------------------
-# get_last_parquet_file_num_from_existing_files
-# ---------------------------------------------------------------------------
-
-def test_get_last_parquet_file_num_from_existing_files_empty_dir_returns_0():
-    assert utils.get_last_parquet_file_num_from_existing_files("mycol") == 0
-
-
-def test_get_last_parquet_file_num_from_existing_files_returns_max_numbered_file():
-    table_dir = utils.get_table_dir("mycol")
-    for num in (1, 5, 3):
-        filename = str(num).zfill(FILE_NAME_LENGTH) + ".parquet"
-        open(os.path.join(table_dir, filename), "wb").close()
-    # Non-numeric / non-parquet files must be ignored.
-    open(os.path.join(table_dir, "notes.txt"), "wb").close()
-    open(os.path.join(table_dir, "Temp_00000000000000000099.parquet"), "wb").close()
-
-    assert utils.get_last_parquet_file_num_from_existing_files("mycol") == 5

@@ -4,6 +4,7 @@ import requests
 import json
 import logging
 from datetime import datetime
+from urllib.parse import urlparse, quote
 import utils
 import constants
 from constants import METADATA_FILE_NAME, PARTNER_EVENTS_FILE_NAME
@@ -163,6 +164,84 @@ def get_file_from_lz(table_name, file_name):
     #     for chunk in response.iter_content():
     #         local_file.write(chunk)
     return (response_status_code, response)
+
+
+def list_files_in_lz(table_name):
+    """List the base file names directly under a collection's Landing Zone folder.
+
+    Best-effort by design: returns an empty list on any error or non-200
+    response. Callers use this only as a fallback source of truth, and must
+    degrade gracefully (start numbering from scratch) rather than crash when the
+    LZ can't be listed.
+    """
+    try:
+        lz_url = os.getenv("LZ_URL")
+        effective_name = utils.get_effective_table_name(table_name)
+        # LZ_URL points at the OneLake *blob* endpoint, but the ADLS Gen2
+        # "List Path" operation (which returns clean JSON) is served from the
+        # *dfs* endpoint. Swap the host to reach it.
+        dfs_url = lz_url.replace(".blob.", ".dfs.")
+        parsed = urlparse(dfs_url)
+        # The first path segment is the filesystem (the Fabric workspace); the
+        # remainder is the directory prefix leading to the LandingZone.
+        path = parsed.path.lstrip("/")
+        segments = path.split("/", 1)
+        filesystem = segments[0]
+        directory_base = segments[1] if len(segments) > 1 else ""
+        directory = (directory_base + effective_name).rstrip("/")
+
+        access_token = __get_access_token(
+            os.getenv("APP_ID"), os.getenv("SECRET"), os.getenv("TENANT_ID")
+        )
+        list_url = (
+            f"{parsed.scheme}://{parsed.netloc}/{filesystem}"
+            f"?resource=filesystem&recursive=false&directory={quote(directory)}"
+        )
+        token_headers = {"Authorization": "Bearer " + access_token}
+        response = requests.get(list_url, headers=token_headers)
+        if response.status_code != 200:
+            logger.warning(
+                "failed to list Landing Zone folder for %s. Server responded with code %s",
+                effective_name,
+                response.status_code,
+            )
+            return []
+        paths = response.json().get("paths", [])
+        file_names = [
+            os.path.basename(entry.get("name", ""))
+            for entry in paths
+            # ADLS marks directories with isDirectory="true"; files omit it.
+            if str(entry.get("isDirectory", "false")).lower() != "true"
+        ]
+        return [name for name in file_names if name]
+    except Exception as e:
+        logger.warning(
+            f"error listing Landing Zone folder for table={table_name}: {e}"
+        )
+        return []
+
+
+def get_last_parquet_file_num_from_lz(table_name) -> int:
+    """Fallback used when the persisted parquet-file counter
+    (LAST_PARQUET_FILE_NUMBER) is missing or corrupted.
+
+    Derives the last-used parquet number from what is ACTUALLY present in the
+    Landing Zone, rather than from local disk. The local data_files/ directory
+    can drift out of sync with the LZ (e.g. a Fabric mirror is torn down and
+    recreated - giving a fresh, empty LZ - while stale numbered parquet files
+    remain locally). Deriving from local files in that case would resume
+    numbering mid-sequence (e.g. ...0104.parquet) into a fresh LZ that Fabric
+    expects to start at ...0001.parquet, so Fabric ingests nothing.
+
+    Returns 0 (i.e. "nothing written yet", so numbering starts at ...0001) when
+    the LZ folder is empty or can't be listed.
+    """
+    numbered = []
+    for file_name in list_files_in_lz(table_name):
+        stem, ext = os.path.splitext(file_name)
+        if ext == ".parquet" and stem.isnumeric():
+            numbered.append(int(stem))
+    return max(numbered) if numbered else 0
 
 
 def push_table_metadata_files(collection_name):

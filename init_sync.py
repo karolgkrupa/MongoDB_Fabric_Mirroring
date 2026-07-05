@@ -26,11 +26,10 @@ from constants import (
 import schema_utils
 from utils import (
     get_parquet_full_path_filename,
-    get_last_parquet_file_num_from_existing_files,
     to_string,
     get_table_dir,
 )
-from push_file_to_lz import push_file_to_lz
+from push_file_to_lz import push_file_to_lz, get_last_parquet_file_num_from_lz
 # not required as now init_sync stat is stored in LZ
 #from flags import set_init_flag, clear_init_flag
 from file_utils import FileType, read_from_file, write_to_file, delete_file
@@ -174,7 +173,7 @@ def init_sync(collection_name: str):
         collection_name, LAST_PARQUET_FILE_NUMBER, FileType.PICKLE
         )
         if not last_parquet_file_num:
-           last_parquet_file_num = get_last_parquet_file_num_from_existing_files(collection_name)
+           last_parquet_file_num = get_last_parquet_file_num_from_lz(collection_name)
 
         parquet_full_path_filename = get_parquet_full_path_filename(collection_name, last_parquet_file_num)
         

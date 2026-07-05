@@ -7,6 +7,7 @@ import pymongo
 import pytest
 
 import listening
+import push_file_to_lz
 import schemas
 import utils
 from constants import (
@@ -110,7 +111,7 @@ def test_process_accumulative_df_delta_phase_flushes_on_time_threshold(monkeypat
     assert result_df is None
 
 
-def test_process_accumulative_df_falls_back_to_directory_scan_when_counter_missing(monkeypatch):
+def test_process_accumulative_df_falls_back_to_lz_listing_when_counter_missing(monkeypatch):
     monkeypatch.setattr(listening, "push_file_to_lz", lambda path, table: None)
     written = []
     monkeypatch.setattr(
@@ -118,10 +119,9 @@ def test_process_accumulative_df_falls_back_to_directory_scan_when_counter_missi
         lambda obj, table, name, ftype, backup_file_name=None: written.append((name, obj)),
     )
     monkeypatch.setattr(listening, "read_from_file", lambda table, name, ftype: None)
-
-    table_dir = utils.get_table_dir("mycol")
+    # LZ already holds up to ...0007.parquet; the fallback derives 7 from the LZ.
     existing_name = str(7).zfill(FILE_NAME_LENGTH) + ".parquet"
-    open(os.path.join(table_dir, existing_name), "wb").close()
+    monkeypatch.setattr(push_file_to_lz, "list_files_in_lz", lambda table: [existing_name])
 
     df = pd.DataFrame({ROW_MARKER_COLUMN_NAME: [0], "_id": [1]})
     logger = logging.getLogger("test")
@@ -132,6 +132,37 @@ def test_process_accumulative_df_falls_back_to_directory_scan_when_counter_missi
 
     counter_writes = [obj for name, obj in written if name == LAST_PARQUET_FILE_NUMBER]
     assert counter_writes == [8]
+
+
+def test_process_accumulative_df_fresh_lz_starts_numbering_at_1_ignoring_stale_local_files(monkeypatch):
+    """Regression: a fresh (empty) LZ plus stale local numbered parquet files must
+    start delta numbering at ...0001.parquet, not resume from the local max."""
+    pushed = []
+    monkeypatch.setattr(listening, "push_file_to_lz", lambda path, table: pushed.append(path))
+    written = []
+    monkeypatch.setattr(
+        listening, "write_to_file",
+        lambda obj, table, name, ftype, backup_file_name=None: written.append((name, obj)),
+    )
+    monkeypatch.setattr(listening, "read_from_file", lambda table, name, ftype: None)
+
+    # Stale local files from a previous run; must be ignored.
+    table_dir = utils.get_table_dir("mycol")
+    for num in (101, 102, 103):
+        open(os.path.join(table_dir, str(num).zfill(FILE_NAME_LENGTH) + ".parquet"), "wb").close()
+    # Fresh LZ: listing returns nothing.
+    monkeypatch.setattr(push_file_to_lz, "list_files_in_lz", lambda table: [])
+
+    df = pd.DataFrame({ROW_MARKER_COLUMN_NAME: [0], "_id": [1]})
+    logger = logging.getLogger("test")
+
+    listening.process_accumulative_df(
+        df, "mycol", "Y", time.time(), 9999, {"tok": 1}, logger, force_flush=True,
+    )
+
+    assert [os.path.basename(p) for p in pushed] == ["00000000000000000001.parquet"]
+    counter_writes = [obj for name, obj in written if name == LAST_PARQUET_FILE_NUMBER]
+    assert counter_writes == [1]
 
 
 def test_process_accumulative_df_clears_recovering_flag_after_successful_flush(monkeypatch):

@@ -1,7 +1,11 @@
 import logging
+import os
 
 import init_sync
+import push_file_to_lz
+import utils
 from constants import (
+    FILE_NAME_LENGTH,
     INIT_SYNC_STATUS_FILE_NAME,
     INIT_SYNC_LAST_ID_FILE_NAME,
     INIT_SYNC_MAX_ID_FILE_NAME,
@@ -145,7 +149,7 @@ def test_init_sync_resumes_from_last_id_and_completes(monkeypatch):
     assert deleted == [INIT_SYNC_LAST_ID_FILE_NAME]
 
 
-def test_init_sync_uses_parquet_counter_fallback_when_missing(monkeypatch):
+def test_init_sync_uses_lz_parquet_counter_fallback_when_missing(monkeypatch):
     docs = [{"_id": 1, "value": "a"}]
     collection = _FakeCollection(docs=docs, max_id=1)
     _install_fake_mongo(monkeypatch, collection)
@@ -154,7 +158,7 @@ def test_init_sync_uses_parquet_counter_fallback_when_missing(monkeypatch):
         INIT_SYNC_STATUS_FILE_NAME: None,
         INIT_SYNC_LAST_ID_FILE_NAME: None,
         INIT_SYNC_MAX_ID_FILE_NAME: None,
-        LAST_PARQUET_FILE_NUMBER: None,
+        LAST_PARQUET_FILE_NUMBER: None,  # persisted counter missing -> LZ fallback
     }
     monkeypatch.setattr(init_sync, "read_from_file", lambda table, name, ftype: file_state.get(name))
     monkeypatch.setattr(init_sync, "write_to_file", lambda obj, table, name, ftype: None)
@@ -164,14 +168,55 @@ def test_init_sync_uses_parquet_counter_fallback_when_missing(monkeypatch):
     monkeypatch.setattr(init_sync.time, "sleep", lambda secs: None)
 
     fallback_calls = []
-    original_fallback = init_sync.get_last_parquet_file_num_from_existing_files
 
     def spy_fallback(table_name):
         fallback_calls.append(table_name)
-        return original_fallback(table_name)
+        return 0
 
-    monkeypatch.setattr(init_sync, "get_last_parquet_file_num_from_existing_files", spy_fallback)
+    monkeypatch.setattr(init_sync, "get_last_parquet_file_num_from_lz", spy_fallback)
 
     init_sync.init_sync("mycol")
 
     assert fallback_calls == ["mycol"]
+
+
+def test_init_sync_fresh_lz_starts_numbering_at_1_ignoring_stale_local_files(monkeypatch):
+    """Regression for the fixes-branch bug where a fresh Fabric mirror (empty LZ)
+    plus stale local parquet files made init sync resume numbering mid-sequence
+    (e.g. ...0104.parquet), which Fabric - expecting ...0001.parquet - ignored.
+    The LZ-derived fallback must ignore local files entirely."""
+    docs = [{"_id": 1, "value": "a"}]
+    collection = _FakeCollection(docs=docs, max_id=1)
+    _install_fake_mongo(monkeypatch, collection)
+
+    # Stale local parquet files left over from a previous run / a torn-down mirror.
+    table_dir = utils.get_table_dir("mycol")
+    for num in (101, 102, 103):
+        open(os.path.join(table_dir, str(num).zfill(FILE_NAME_LENGTH) + ".parquet"), "wb").close()
+
+    file_state = {
+        INIT_SYNC_STATUS_FILE_NAME: None,
+        INIT_SYNC_LAST_ID_FILE_NAME: None,
+        INIT_SYNC_MAX_ID_FILE_NAME: None,
+        LAST_PARQUET_FILE_NUMBER: None,  # fresh LZ: persisted counter is a 404
+    }
+    monkeypatch.setattr(init_sync, "read_from_file", lambda table, name, ftype: file_state.get(name))
+    written = []
+    monkeypatch.setattr(init_sync, "write_to_file", lambda obj, table, name, ftype: written.append((name, obj)))
+    monkeypatch.setattr(init_sync, "delete_file", lambda table, name: None)
+    pushed = []
+    monkeypatch.setattr(init_sync, "push_file_to_lz", lambda path, table: pushed.append(path))
+    monkeypatch.setattr(init_sync.schema_utils, "process_dataframe", lambda table, df: None)
+    monkeypatch.setattr(init_sync.time, "sleep", lambda secs: None)
+    # Fresh LZ: listing the collection's LZ folder returns nothing. Exercise the
+    # REAL get_last_parquet_file_num_from_lz so the test proves local files are ignored.
+    monkeypatch.setattr(push_file_to_lz, "list_files_in_lz", lambda table: [])
+
+    init_sync.init_sync("mycol")
+
+    parquet_pushes = [
+        os.path.basename(p) for p in pushed if os.path.basename(p)[:1].isdigit()
+    ]
+    assert parquet_pushes == ["00000000000000000001.parquet"]
+    counter_writes = [obj for name, obj in written if name == LAST_PARQUET_FILE_NUMBER]
+    assert counter_writes == [1]
