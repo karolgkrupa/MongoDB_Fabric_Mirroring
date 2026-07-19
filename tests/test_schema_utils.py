@@ -122,6 +122,13 @@ def test_types_compatible_datetime_family():
     assert schema_utils._types_compatible(pd.Timestamp, datetime)
 
 
+def test_types_compatible_void_accepts_any_concrete_type():
+    assert schema_utils._types_compatible(schema_utils.VoidType, int)
+    assert schema_utils._types_compatible(schema_utils.VoidType, str)
+    assert schema_utils._types_compatible(schema_utils.VoidType, list)
+    assert schema_utils._types_compatible(schema_utils.VoidType, NoneType)
+
+
 def test_types_compatible_nonetype_always_compatible():
     assert schema_utils._types_compatible(int, NoneType)
     assert schema_utils._types_compatible(str, NoneType)
@@ -143,9 +150,15 @@ def test_types_compatible_incompatible_types():
 # init_column_schema
 # ---------------------------------------------------------------------------
 
-def test_init_column_schema_nonetype_becomes_str_object():
+def test_init_column_schema_nonetype_becomes_void_object():
     schema = schema_utils.init_column_schema("object", None)
-    assert schema[TYPE_KEY] == str
+    assert schema[TYPE_KEY] is schema_utils.VoidType
+    assert schema[DTYPE_KEY] == "object"
+
+
+def test_init_column_schema_nan_becomes_void_object():
+    schema = schema_utils.init_column_schema("float64", np.nan)
+    assert schema[TYPE_KEY] is schema_utils.VoidType
     assert schema[DTYPE_KEY] == "object"
 
 
@@ -216,6 +229,45 @@ def test_process_dataframe_nan_value_does_not_signal(monkeypatch):
     signal = schema_utils.process_dataframe("mycol", df)
 
     assert signal is None
+
+
+def test_process_dataframe_void_column_promotes_on_first_concrete_value(monkeypatch):
+    monkeypatch.setattr(schemas, "write_to_file", lambda *a, **k: None)
+    schemas.init_table_schema_to_mem(
+        "mycol",
+        {"BasFilesUploaded": {TYPE_KEY: schema_utils.VoidType, DTYPE_KEY: "object"}},
+    )
+
+    df = pd.DataFrame({"_id": [1], "BasFilesUploaded": [["a.pdf", "b.pdf"]]})
+    signal = schema_utils.process_dataframe("mycol", df)
+
+    assert signal is None
+    schema = schemas.get_table_column_schema("mycol", "BasFilesUploaded")
+    # lists are stored as str in the internal schema
+    assert schema[TYPE_KEY] == str
+
+
+def test_process_dataframe_void_sibling_fields_do_not_ping_pong(monkeypatch):
+    """Re-seed style: one sparse array field empty, the other a list — then swap.
+    Neither should raise a schema-change signal once empty fields are Void."""
+    monkeypatch.setattr(schemas, "write_to_file", lambda *a, **k: None)
+    schemas.init_table_schema_to_mem("mycol", {})
+
+    doc_a = pd.DataFrame(
+        {"_id": [1], "AnalysedIbans": [["PL123"]], "BasFilesUploaded": [np.nan]}
+    )
+    assert schema_utils.process_dataframe("mycol", doc_a) is None
+    assert schemas.get_table_column_schema("mycol", "AnalysedIbans")[TYPE_KEY] == str
+    assert (
+        schemas.get_table_column_schema("mycol", "BasFilesUploaded")[TYPE_KEY]
+        is schema_utils.VoidType
+    )
+
+    doc_b = pd.DataFrame(
+        {"_id": [2], "AnalysedIbans": [np.nan], "BasFilesUploaded": [[{"name": "x"}]]}
+    )
+    assert schema_utils.process_dataframe("mycol", doc_b) is None
+    assert schemas.get_table_column_schema("mycol", "BasFilesUploaded")[TYPE_KEY] == str
 
 
 def test_process_dataframe_uses_renamed_column_schema(monkeypatch):

@@ -36,6 +36,23 @@ logger = logging.getLogger(f"{__name__}")
 #17June2025 - added NoneType manually instead of importing from types for 3.9 and lesser Python versions
 NoneType = type(None)
 
+
+class VoidType:
+    """Marker type: column has only been seen as null/NaN/absent so far.
+
+    Compatible with any concrete value. process_dataframe promotes VoidType to
+    the first real value's type in place (no schema-version bump).
+    """
+
+
+def _is_empty_value(value) -> bool:
+    """True for Mongo null/absent stand-ins: None or pandas/NumPy NaN scalars."""
+    if value is None:
+        return True
+    if type(value) in (float, np.float64, np.float32) and pd.isna(value):
+        return True
+    return False
+
 def _converter_template(obj, type_name, raw_convert_func, default_value=None):
     original_type = type(obj) 
     logger.debug(f"Converting {obj} of type {original_type} to {type_name}.")
@@ -167,6 +184,8 @@ _TO_STRING_TYPES = {list, dict, bson.ObjectId, bson.binary.Binary}
 def _types_compatible(expected_type, actual_type) -> bool:
     if expected_type == actual_type:
         return True
+    if expected_type is VoidType:
+        return True
     if actual_type is NoneType:
         return True
     if expected_type in _NUMERIC_TYPES and actual_type in _NUMERIC_TYPES:
@@ -195,13 +214,13 @@ def init_column_schema(column_dtype, first_item) -> dict:
     schema_of_this_column = {}
     if any(isinstance(first_item, t) for t in TYPES_TO_CONVERT_TO_STR):
         item_type = str
-    # when encountering NoneType column, force convert it to str
-    if item_type == NoneType:
-    # if item_type is None:
-        item_type = str
+    # Null/NaN/absent: do not guess float64 (pandas NaN) or str. Stay Void until
+    # a concrete value arrives; process_dataframe will promote in place.
+    if _is_empty_value(first_item):
+        item_type = VoidType
         column_dtype = "object"
     #Diana - handling bson.Decimal128 cant be target data type as it cant be written to parquet
-    if isinstance(first_item, bson.Decimal128):
+    elif isinstance(first_item, bson.Decimal128):
         item_type = float
     #It takes column dtype as object otherwise     
     #    column_dtype = "object"
@@ -384,14 +403,33 @@ def process_dataframe(table_name_param: str, df: pd.DataFrame):
         #if current_item_type != schema_of_this_column[TYPE_KEY]:
         expected_type = schema_of_this_column[TYPE_KEY]
 
+        # Void columns have no concrete type yet. Promote in place on the first
+        # real value so sparse fields (e.g. arrays that were null at seed time)
+        # do not lock as float64 and later force schema-version bumps.
+        if (
+            expected_type is VoidType
+            and not is_new_column
+            and not _is_empty_value(current_first_item)
+        ):
+            schema_of_this_column = init_column_schema(
+                current_dtype, current_first_item
+            )
+            schemas.append_schema_column(
+                table_name, col_name, schema_of_this_column
+            )
+            expected_type = schema_of_this_column[TYPE_KEY]
+            logger.info(
+                "promoted void schema for column %s of %s to %s",
+                col_name,
+                table_name,
+                expected_type,
+            )
+
         # Detect breaking type change on an existing column. Caller decides whether
         # to act on it (e.g. listening.py bumps the schema version; init_sync.py ignores).
-        if not is_new_column and current_first_item is not None:
+        if not is_new_column and not _is_empty_value(current_first_item):
             actual_type = type(current_first_item)
-            is_nan_scalar = (
-                actual_type in (float, np.float64) and pd.isna(current_first_item)
-            )
-            if not is_nan_scalar and not _types_compatible(expected_type, actual_type):
+            if not _types_compatible(expected_type, actual_type):
                 logger.warning(
                     f"schema change detected on column {col_name}: "
                     f"expected {expected_type}, got {actual_type}"
@@ -401,19 +439,20 @@ def process_dataframe(table_name_param: str, df: pd.DataFrame):
                     expected_type=expected_type,
                     actual_type=actual_type,
                 )
-        for item in df[col_name]:
-            current_column_name = col_name
-            if not isinstance(item, expected_type):
-                logger.debug(
-                    f" item type detected: current item is {item} of type={type(item)}, expected item type from schema= {expected_type}"
-                )
-                conversion_fcn = TYPE_TO_CONVERT_FUNCTION_MAP.get(
-                    expected_type, do_nothing
-                )
-                
-                # Set the current column name for logging
-                df[col_name] = df[col_name].apply(conversion_fcn)
-                break
+        if expected_type is not VoidType:
+            for item in df[col_name]:
+                current_column_name = col_name
+                if not isinstance(item, expected_type):
+                    logger.debug(
+                        f" item type detected: current item is {item} of type={type(item)}, expected item type from schema= {expected_type}"
+                    )
+                    conversion_fcn = TYPE_TO_CONVERT_FUNCTION_MAP.get(
+                        expected_type, do_nothing
+                    )
+                    
+                    # Set the current column name for logging
+                    df[col_name] = df[col_name].apply(conversion_fcn)
+                    break
         # for index, item in enumerate(df[col_name]):
             # print(f"Row {index}: Value={item}, Type={type(item)}")
             
