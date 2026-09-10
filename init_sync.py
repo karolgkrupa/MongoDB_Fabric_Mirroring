@@ -160,7 +160,11 @@ def init_sync(collection_name: str):
         logger.info(f"last _id of this batch: {raw_last_id}")
 
         # process df according to internal schema
-        schema_utils.process_dataframe(collection_name, batch_df)
+        # init sync cannot bump the schema version, so incompatible values are
+        # coerced to the schema type instead of being written raw
+        schema_utils.process_dataframe(
+            collection_name, batch_df, signal_type_changes=False
+        )
 
         trans_end_time = time.time()
         if enable_perf_timer:
@@ -179,13 +183,9 @@ def init_sync(collection_name: str):
         
         logger.info(f"writing parquet file: {parquet_full_path_filename}")
 
-        # Convert any remaining Object column into String
-        id_col = batch_df['_id']
-        obj_cols = batch_df.select_dtypes(include=['object']).columns
-        batch_df[obj_cols] = batch_df[obj_cols].astype(str,errors="ignore")
-        
-        #  Restore the _id column
-        batch_df['_id'] = id_col
+        # Align dtypes with the schema, drop all-null Void columns and stringify
+        # any remaining Object column
+        schema_utils.prepare_df_for_parquet(collection_name, batch_df)
 
         # Write the parquet file
         batch_df.to_parquet(parquet_full_path_filename, index=False)

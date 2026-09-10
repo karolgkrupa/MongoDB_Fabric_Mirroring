@@ -135,7 +135,7 @@ def test_init_sync_resumes_from_last_id_and_completes(monkeypatch):
     monkeypatch.setattr(init_sync, "delete_file", lambda table, name: deleted.append(name))
     pushed = []
     monkeypatch.setattr(init_sync, "push_file_to_lz", lambda path, table: pushed.append(path))
-    monkeypatch.setattr(init_sync.schema_utils, "process_dataframe", lambda table, df: None)
+    monkeypatch.setattr(init_sync.schema_utils, "process_dataframe", lambda table, df, **k: None)
     monkeypatch.setattr(init_sync.time, "sleep", lambda secs: None)
 
     init_sync.init_sync("mycol")
@@ -164,7 +164,7 @@ def test_init_sync_uses_lz_parquet_counter_fallback_when_missing(monkeypatch):
     monkeypatch.setattr(init_sync, "write_to_file", lambda obj, table, name, ftype: None)
     monkeypatch.setattr(init_sync, "delete_file", lambda table, name: None)
     monkeypatch.setattr(init_sync, "push_file_to_lz", lambda path, table: None)
-    monkeypatch.setattr(init_sync.schema_utils, "process_dataframe", lambda table, df: None)
+    monkeypatch.setattr(init_sync.schema_utils, "process_dataframe", lambda table, df, **k: None)
     monkeypatch.setattr(init_sync.time, "sleep", lambda secs: None)
 
     fallback_calls = []
@@ -206,7 +206,7 @@ def test_init_sync_fresh_lz_starts_numbering_at_1_ignoring_stale_local_files(mon
     monkeypatch.setattr(init_sync, "delete_file", lambda table, name: None)
     pushed = []
     monkeypatch.setattr(init_sync, "push_file_to_lz", lambda path, table: pushed.append(path))
-    monkeypatch.setattr(init_sync.schema_utils, "process_dataframe", lambda table, df: None)
+    monkeypatch.setattr(init_sync.schema_utils, "process_dataframe", lambda table, df, **k: None)
     monkeypatch.setattr(init_sync.time, "sleep", lambda secs: None)
     # Fresh LZ: listing the collection's LZ folder returns nothing. Exercise the
     # REAL get_last_parquet_file_num_from_lz so the test proves local files are ignored.

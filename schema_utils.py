@@ -177,6 +177,8 @@ class SchemaChangeSignal:
 
 _NUMERIC_TYPES = {int, float, np.int32, np.int64, np.float64, bson.int64.Int64, bson.Decimal128}
 _BOOL_TYPES = {bool, np.bool_}
+_INT_TYPES = {int, np.int32, np.int64, bson.int64.Int64}
+_FLOAT_TYPES = {float, np.float64}
 _DATETIME_TYPES = {date, datetime, pd.Timestamp}
 _TO_STRING_TYPES = {list, dict, bson.ObjectId, bson.binary.Binary}
 
@@ -194,7 +196,9 @@ def _types_compatible(expected_type, actual_type) -> bool:
         return True
     if expected_type in _DATETIME_TYPES and actual_type in _DATETIME_TYPES:
         return True
-    if expected_type == str and actual_type in _TO_STRING_TYPES:
+    # str is a sink: to_string handles every scalar, list and dict, so a string
+    # column can absorb any incoming type without a schema-version bump.
+    if expected_type == str:
         return True
     return False
 
@@ -224,6 +228,15 @@ def init_column_schema(column_dtype, first_item) -> dict:
         item_type = float
     #It takes column dtype as object otherwise     
     #    column_dtype = "object"
+        column_dtype = "float64"
+    # Derive the dtype from the value's type, not the pandas column dtype: a bool
+    # or int column with any null is "object" in pandas, which would otherwise be
+    # stringified at flush time and flip the column type between parquet files.
+    elif item_type in _BOOL_TYPES:
+        column_dtype = "boolean"
+    elif item_type in _INT_TYPES:
+        column_dtype = "Int64"
+    elif item_type in _FLOAT_TYPES:
         column_dtype = "float64"
     #Diana 107 comment and prints added
     # if not column_dtype:
@@ -351,7 +364,18 @@ def init_table_schema(table_name: str):
         schemas.init_column_renaming(table_name, column_renaming_of_this_table)
 
 
-def process_dataframe(table_name_param: str, df: pd.DataFrame):
+def process_dataframe(
+    table_name_param: str, df: pd.DataFrame, signal_type_changes: bool = True
+):
+    """Convert df in place according to the table's internal schema.
+
+    With signal_type_changes=True an incompatible type on an existing column
+    returns a SchemaChangeSignal (df left partially processed; the caller is
+    expected to bump the schema version and re-process). With False, the
+    incompatible values are coerced to the schema type instead, so callers that
+    cannot bump (init sync, deltas before init sync finishes) never write raw
+    values.
+    """
     global current_column_name, table_name, conversion_flag
     table_name = table_name_param
     conversion_flag = False
@@ -425,8 +449,8 @@ def process_dataframe(table_name_param: str, df: pd.DataFrame):
                 expected_type,
             )
 
-        # Detect breaking type change on an existing column. Caller decides whether
-        # to act on it (e.g. listening.py bumps the schema version; init_sync.py ignores).
+        # Detect breaking type change on an existing column. If the caller can't
+        # act on it (signal_type_changes=False), fall through and coerce.
         if not is_new_column and not _is_empty_value(current_first_item):
             actual_type = type(current_first_item)
             if not _types_compatible(expected_type, actual_type):
@@ -434,11 +458,12 @@ def process_dataframe(table_name_param: str, df: pd.DataFrame):
                     f"schema change detected on column {col_name}: "
                     f"expected {expected_type}, got {actual_type}"
                 )
-                return SchemaChangeSignal(
-                    column_name=col_name,
-                    expected_type=expected_type,
-                    actual_type=actual_type,
-                )
+                if signal_type_changes:
+                    return SchemaChangeSignal(
+                        column_name=col_name,
+                        expected_type=expected_type,
+                        actual_type=actual_type,
+                    )
         if expected_type is not VoidType:
             for item in df[col_name]:
                 current_column_name = col_name
@@ -520,3 +545,49 @@ def process_dataframe(table_name_param: str, df: pd.DataFrame):
     if os.path.exists(conversion_log_path) and conversion_flag:
         push_file_to_lz(conversion_log_path, table_name)
     return None
+
+
+def prepare_df_for_parquet(table_name: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Final pre-write step so each column keeps one parquet type across files.
+
+    Modifies df in place (callers rely on keeping the same object on failure):
+      1. drops all-null VoidType columns, so a column first reaches Fabric with
+         its real type instead of as string;
+      2. casts schema columns back to their schema dtype (pd.concat of batches
+         processed at different times can widen e.g. boolean to object);
+      3. stringifies any remaining object column except _id.
+    """
+    table_schema = schemas.get_table_schema(table_name) or {}
+
+    void_cols = [
+        col_name
+        for col_name in df.columns
+        if (table_schema.get(col_name) or {}).get(TYPE_KEY) is VoidType
+        and df[col_name].isna().all()
+    ]
+    if void_cols:
+        df.drop(columns=void_cols, inplace=True)
+
+    for col_name in df.columns:
+        schema_of_this_column = table_schema.get(col_name)
+        if col_name == "_id" or not schema_of_this_column:
+            continue
+        target_dtype = schema_of_this_column[DTYPE_KEY]
+        if str(df[col_name].dtype) == str(target_dtype):
+            continue
+        if is_datetime64_any_dtype(df[col_name]) and is_object_dtype(target_dtype):
+            continue
+        try:
+            df[col_name] = df[col_name].astype(target_dtype)
+        except (ValueError, TypeError) as e:
+            logger.warning(
+                f"An {e.__class__.__name__} was caught when trying to convert "
+                + f"the dtype of the column {col_name} from {df[col_name].dtype} to {target_dtype}"
+            )
+
+    # Convert any remaining Object column into String, keeping _id as-is
+    id_col = df["_id"]
+    obj_cols = df.select_dtypes(include=["object"]).columns
+    df[obj_cols] = df[obj_cols].astype(str, errors="ignore")
+    df["_id"] = id_col
+    return df

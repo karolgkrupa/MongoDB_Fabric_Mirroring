@@ -406,7 +406,7 @@ def test_listening_recovering_from_backup_token_forces_upsert_for_insert(monkeyp
         listening, "read_from_file",
         lambda table, name, ftype: "Y" if "init_sync_status" in name else None,
     )
-    monkeypatch.setattr(listening.schema_utils, "process_dataframe", lambda table, df: None)
+    monkeypatch.setattr(listening.schema_utils, "process_dataframe", lambda table, df, **k: None)
     monkeypatch.setattr(listening.time, "sleep", lambda secs: None)
 
     captured = {}
@@ -443,7 +443,7 @@ def test_listening_normal_insert_uses_standard_row_marker_when_not_recovering(mo
         listening, "read_from_file",
         lambda table, name, ftype: "Y" if "init_sync_status" in name else None,
     )
-    monkeypatch.setattr(listening.schema_utils, "process_dataframe", lambda table, df: None)
+    monkeypatch.setattr(listening.schema_utils, "process_dataframe", lambda table, df, **k: None)
     monkeypatch.setattr(listening.time, "sleep", lambda secs: None)
 
     captured = {}

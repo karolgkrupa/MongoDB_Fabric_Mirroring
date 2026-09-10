@@ -200,7 +200,13 @@ def listening(collection_name: str):
                     resume_token = change["_id"]
                     logger.debug("resume_token: %s", resume_token)
 
-                    schema_change_signal = schema_utils.process_dataframe(collection_name, df)
+                    # Before init sync finishes we can't bump the schema version, so
+                    # coerce incompatible values to the schema type instead.
+                    schema_change_signal = schema_utils.process_dataframe(
+                        collection_name,
+                        df,
+                        signal_type_changes=(init_sync_stat_flag == "Y"),
+                    )
 
                     if schema_change_signal is not None and init_sync_stat_flag == "Y":
                         logger.warning(
@@ -407,6 +413,7 @@ def process_accumulative_df(accumulative_df, collection_name, init_sync_stat_fla
                     collection_name, prefix=prefix
                 )
                 logger.info(f"writing TEMP parquet file: {parquet_full_path_filename}")
+                schema_utils.prepare_df_for_parquet(collection_name, accumulative_df)
                 accumulative_df.to_parquet(parquet_full_path_filename)
                 accumulative_df = None
             except Exception as exc:
@@ -438,13 +445,9 @@ def process_accumulative_df(accumulative_df, collection_name, init_sync_stat_fla
                     parquet_full_path_filename = get_parquet_full_path_filename(collection_name, last_parquet_file_num)
 
                     logger.info(f"writing parquet file: {parquet_full_path_filename}")
-                    # Convert any remaining Object column into String
-                    id_col = accumulative_df['_id']
-                    obj_cols = accumulative_df.select_dtypes(include=['object']).columns
-                    accumulative_df[obj_cols] = accumulative_df[obj_cols].astype(str,errors="ignore")
-
-                    #  Restore the _id column
-                    accumulative_df['_id'] = id_col
+                    # Align dtypes with the schema, drop all-null Void columns and
+                    # stringify any remaining Object column
+                    schema_utils.prepare_df_for_parquet(collection_name, accumulative_df)
                     # Write the parquet file
                     accumulative_df.to_parquet(parquet_full_path_filename)
 

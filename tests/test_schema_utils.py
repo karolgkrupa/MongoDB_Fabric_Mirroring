@@ -143,7 +143,14 @@ def test_types_compatible_str_accepts_list_dict_objectid_binary():
 
 def test_types_compatible_incompatible_types():
     assert not schema_utils._types_compatible(int, str)
-    assert not schema_utils._types_compatible(str, int)
+    assert not schema_utils._types_compatible(bool, str)
+
+
+def test_types_compatible_str_is_a_sink():
+    # to_string can absorb any value, so a string column never forces a bump
+    assert schema_utils._types_compatible(str, int)
+    assert schema_utils._types_compatible(str, bool)
+    assert schema_utils._types_compatible(str, float)
 
 
 # ---------------------------------------------------------------------------
@@ -281,3 +288,82 @@ def test_process_dataframe_uses_renamed_column_schema(monkeypatch):
     assert signal is None
     assert "Original_Col" in df.columns
     assert "Original Col" not in df.columns
+
+
+# ---------------------------------------------------------------------------
+# Regressions for Fabric SchemaMergeFailure (column type flipping between files)
+# ---------------------------------------------------------------------------
+
+def _parquet_types(df):
+    import io
+    import pyarrow.parquet as pq
+
+    buf = io.BytesIO()
+    df.to_parquet(buf, index=False)
+    buf.seek(0)
+    return {f.name: str(f.type) for f in pq.read_schema(buf) if f.name != "_id"}
+
+
+def test_init_column_schema_nullable_scalars_ignore_object_column_dtype():
+    # a bool/int column containing a null is "object" in pandas
+    assert schema_utils.init_column_schema("object", True)[DTYPE_KEY] == "boolean"
+    assert schema_utils.init_column_schema("object", 5)[DTYPE_KEY] == "Int64"
+
+
+def test_process_dataframe_suppressed_signal_coerces_and_continues(monkeypatch):
+    monkeypatch.setattr(schemas, "write_to_file", lambda *a, **k: None)
+    schemas.init_table_schema_to_mem(
+        "mycol",
+        {
+            "flag": {TYPE_KEY: bool, DTYPE_KEY: "boolean"},
+            "later": {TYPE_KEY: bool, DTYPE_KEY: "boolean"},
+        },
+    )
+
+    df = pd.DataFrame(
+        {"_id": [1, 2], "flag": [1, 0], "later": pd.Series([True, None], dtype=object)}
+    )
+    signal = schema_utils.process_dataframe("mycol", df, signal_type_changes=False)
+
+    assert signal is None
+    assert df["flag"].tolist() == [True, False]
+    # the column after the offending one must still be converted
+    assert str(df["later"].dtype) == "boolean"
+    assert _parquet_types(df) == {"flag": "bool", "later": "bool"}
+
+
+def test_process_dataframe_str_column_absorbs_int(monkeypatch):
+    monkeypatch.setattr(schemas, "write_to_file", lambda *a, **k: None)
+    schemas.init_table_schema_to_mem("mycol", {"Hash": {TYPE_KEY: str, DTYPE_KEY: "object"}})
+
+    df = pd.DataFrame({"_id": [1, 2], "Hash": [12345, 999]})
+    signal = schema_utils.process_dataframe("mycol", df)
+
+    assert signal is None
+    assert df["Hash"].tolist() == ["12345", "999"]
+
+
+def test_prepare_df_for_parquet_drops_void_and_restores_schema_dtype(monkeypatch):
+    monkeypatch.setattr(schemas, "write_to_file", lambda *a, **k: None)
+    schemas.init_table_schema_to_mem(
+        "mycol",
+        {
+            "OfferChosen": {TYPE_KEY: schema_utils.VoidType, DTYPE_KEY: "object"},
+            "IsComplete": {TYPE_KEY: bool, DTYPE_KEY: "boolean"},
+        },
+    )
+    # what pd.concat of separately processed CDC rows can produce
+    df = pd.DataFrame(
+        {
+            "_id": pd.Series([1, 2], dtype=object),
+            "OfferChosen": [None, None],
+            "IsComplete": pd.Series([True, None], dtype=object),
+        }
+    )
+
+    result = schema_utils.prepare_df_for_parquet("mycol", df)
+
+    assert result is df  # modified in place
+    assert "OfferChosen" not in df.columns
+    assert df["_id"].tolist() == [1, 2]  # _id is never stringified
+    assert _parquet_types(df) == {"IsComplete": "bool"}
